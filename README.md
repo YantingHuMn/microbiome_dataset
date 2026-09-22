@@ -17,7 +17,3 @@ The planned database may include:
 - `scripts/`: Data downloading, processing, and integration scripts
 - `metadata/`: Standardized study and sample metadata
 - `docs/`: Documentation
-
-## Notes
-
-Large data files and identifiable human information should not be uploaded to this repository.

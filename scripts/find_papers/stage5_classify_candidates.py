@@ -7,6 +7,8 @@ import csv
 import re
 from collections import defaultdict
 from pathlib import Path
+import sys
+csv.field_size_limit(sys.maxsize)
 
 ABUND = re.compile(r"abundance|taxonomic.profile|feature.table|otu.table|asv.table|\.biom(?:\.|$)|\.qza(?:\.|$)|bracken|kraken|metaphlan|centrifuge|kaiju|species.profile|genus.profile|viral.profile", re.I)
 READS = re.compile(r"\.f(?:ast)?q(?:\.gz)?$|fastq_ftp|\.sra$", re.I)
