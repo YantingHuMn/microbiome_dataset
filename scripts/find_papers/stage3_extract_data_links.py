@@ -32,7 +32,21 @@ PATTERNS = [
     ("figshare", re.compile(r"(?:10\.6084/m9\.figshare\.|figshare\.com/articles/\S*?/)(\d{5,})", re.I)),
     ("dryad", re.compile(r"10\.5061/dryad\.([a-z0-9]+)", re.I)),
     ("mendeley", re.compile(r"data\.mendeley\.com/datasets/([a-z0-9]+)", re.I)),
+    ("osf", re.compile(r"osf\.io/([a-z0-9]{5})\b", re.I)),
+    ("github", re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", re.I)),
 ]
+
+# GitHub repos that are analysis tools, not data deposits. In a manual audit
+# of an earlier paper batch, 26/61 papers cited one of these; unfiltered, the
+# github channel is almost pure noise (pipeline utilities, not abundance
+# tables). Extend this set as new tool repos turn up.
+GITHUB_TOOL_DENYLIST = {
+    "raivokolde/pheatmap", "pmartinezarbizu/pairwiseadonis", "mikemc/speedyseq",
+    "joey711/phyloseq", "benjjneb/dada2", "microbiome/microbiome",
+    "jfq3/qsrutils", "vegandevs/vegan", "twbattaglia/btools",
+    "zdk123/spieceasi", "hallucigenia-sparsa/seqtime", "biobakery/humann",
+    "biobakery/metaphlan", "qiime2/qiime2", "ropensci/taxize",
+}
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 DATA_HOST = re.compile(r"ncbi\.nlm\.nih\.gov|ebi\.ac\.uk|ena|mgnify|zenodo|figshare|dryad|mendeley|osf\.io|github\.com|dataverse", re.I)
 
@@ -83,12 +97,20 @@ def main() -> None:
         seen = set()
         for repo, rx in PATTERNS:
             for m in rx.finditer(search_text):
-                acc = m.group(1).upper() if repo not in {"zenodo", "figshare", "dryad", "mendeley"} else m.group(1)
+                acc = m.group(1).upper() if repo not in {"zenodo", "figshare", "dryad", "mendeley", "osf", "github"} else m.group(1)
+                if repo == "github" and acc.lower() in GITHUB_TOOL_DENYLIST:
+                    continue
                 key = (repo, acc)
                 if key not in seen:
                     seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
                         "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": repo,
                         "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext" if raw else "abstract"})
+        if r.get("pmcid"):
+            key = ("europepmc_supp", r["pmcid"])
+            if key not in seen:
+                seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "europepmc_supp",
+                    "accession": r["pmcid"], "raw_url": "", "link_type": "accession", "source": "pmcid"})
         for m in BIOPROJECT_NUM.finditer(html.unescape(raw)):
             acc = m.group(1)
             key = ("bioproject", acc)
