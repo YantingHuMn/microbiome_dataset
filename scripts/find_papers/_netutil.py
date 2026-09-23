@@ -20,7 +20,15 @@ DEFAULT_MIN_INTERVAL = 0.34          # ~3 req/s, safe for most APIs
 HOST_MIN_INTERVAL = {
     "eutils.ncbi.nlm.nih.gov": 0.34,  # 3/s anonymous, overridden below if keyed
     "www.ncbi.nlm.nih.gov": 0.34,
-    "www.ebi.ac.uk": 0.10,
+    # www.ebi.ac.uk serves BOTH the Europe PMC search API (heavy,
+    # pageSize=1000/resultType=core payloads) and the per-article
+    # fullTextXML/supplementaryFiles endpoints (light, single-article).
+    # Measured empirically: 8 concurrent workers at 0.10s against the
+    # SEARCH endpoint triggered repeated HTTP 503s from EBI (absorbed by
+    # stage1's retry/backoff, but that's borrowed time, not a safe rate).
+    # 0.5s is conservative enough to avoid that while still letting
+    # --workers overlap latency across different queries/articles.
+    "www.ebi.ac.uk": 0.5,
     "api.figshare.com": 0.10,
     "ndownloader.figshare.com": 0.05,
     "zenodo.org": 0.20,
