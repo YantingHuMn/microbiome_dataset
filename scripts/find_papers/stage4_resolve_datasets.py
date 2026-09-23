@@ -7,6 +7,11 @@ in stage5), then discards the bytes. It writes nothing to disk. Actually
 downloading and opening file *contents* is a separate, explicit stage
 (stage6_verify_abundance.py) so the "never persist deposited data" contract
 of stages 0-5 still holds.
+
+--workers > 1 resolves multiple accessions concurrently; see _netutil.py for
+the shared per-host Throttle that keeps this safe -- more workers overlaps
+latency across DIFFERENT hosts, it does not send more requests/sec to any
+ONE host than a single worker would.
 """
 from __future__ import annotations
 
@@ -14,11 +19,16 @@ import argparse
 import csv
 import io
 import json
+import sys
 import time
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
 UA = {"User-Agent": "microbiome-dataset-resolver/1.0 (academic research)"}
 TEMPLATES = {
@@ -39,6 +49,7 @@ MAX_SUPP_ZIP_MB = 300  # abandon a listing if the supplementary bundle is absurd
 
 def get_json(url: str) -> tuple[dict | list | None, str]:
     try:
+        GLOBAL_THROTTLE.wait(url)
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90) as r:
             return json.loads(r.read()), ""
     except Exception as e: return None, str(e)
@@ -59,6 +70,7 @@ def list_zip_names(url: str, max_mb: float = MAX_SUPP_ZIP_MB) -> tuple[list[str]
     into nested zips -- MDPI/OUP ship zip-inside-zip), then drop the bytes.
     Nothing is written to disk."""
     try:
+        GLOBAL_THROTTLE.wait(url)
         req = urllib.request.Request(url, headers=UA)
         with urllib.request.urlopen(req, timeout=180) as r:
             cl = r.headers.get("Content-Length")
@@ -134,12 +146,53 @@ def list_record(repo: str, acc: str) -> tuple[list[str], str, str, dict[str, str
     return [], "", "", {}
 
 
+def resolve_one(repo: str, key, x: dict) -> dict:
+    acc = x["accession"]
+    landing = TEMPLATES.get(repo, "").format(a=acc) if acc else x["raw_url"]
+    files, api, err, metadata = list_record(repo, acc) if acc else ([], "", "", {})
+    api = ";".join(v for v in (x["normalization_api"], api) if v)
+    err = "; ".join(v for v in (x["normalization_error"], err) if v)
+    return {"dataset_id": f"{repo}:{acc or key}", "repository": repo, "accession": acc,
+            "paper_ids": ";".join(sorted(x["paper_ids"])), "pmids": ";".join(sorted(x["pmids"])),
+            "dois": ";".join(sorted(x["dois"])), "landing_url": landing,
+            "metadata_api_url": api, "n_listed_files": len(files),
+            "listed_files": ";".join(files), "library_strategy": metadata.get("library_strategy", ""),
+            "library_source": metadata.get("library_source", ""), "library_layout": metadata.get("library_layout", ""),
+            "instrument_platform": metadata.get("instrument_platform", ""), "resolve_status": "error" if err else "ok",
+            "resolve_error": err[:500], "data_downloaded": False}
+
+
+def mgnify_lookup_one(bp: str, src_row: dict) -> list[dict]:
+    api = f"https://www.ebi.ac.uk/metagenomics/api/v1/studies?bioproject={bp}"
+    d, err = get_json(api)
+    out = []
+    for it in (d or {}).get("data", []):
+        mgys = it.get("id", "")
+        if not mgys:
+            continue
+        files, mapi, merr, _ = list_record("mgnify_study", mgys)
+        out.append({"dataset_id": f"mgnify_from_bioproject:{mgys}", "repository": "mgnify_study",
+                    "accession": mgys, "paper_ids": src_row["paper_ids"], "pmids": src_row["pmids"],
+                    "dois": src_row["dois"], "landing_url": TEMPLATES["mgnify_study"].format(a=mgys),
+                    "metadata_api_url": f"{api};{mapi}", "n_listed_files": len(files),
+                    "listed_files": ";".join(files), "library_strategy": "", "library_source": "",
+                    "library_layout": "", "instrument_platform": "",
+                    "resolve_status": "error" if (err or merr) else "ok",
+                    "resolve_error": "; ".join(v for v in (err, merr) if v)[:500],
+                    "data_downloaded": False})
+    return out
+
+
 def main() -> None:
     base = Path(__file__).resolve().parent / "results"
     ap = argparse.ArgumentParser()
     ap.add_argument("--links", default=str(base / "stage3_links/paper_data_links.csv"))
     ap.add_argument("--outdir", required=True, help="Directory for stage 4 outputs")
-    ap.add_argument("--sleep", type=float, default=0.2)
+    ap.add_argument("--sleep", type=float, default=0.2,
+                    help="ignored when --workers > 1 -- the shared Throttle paces requests instead")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel accessions resolved at once. Safe to raise (8-16 is reasonable) "
+                         "-- see _netutil.Throttle for why this doesn't hit any one API harder.")
     args = ap.parse_args()
     grouped = {}
     bioproject_cache = {}
@@ -155,51 +208,39 @@ def main() -> None:
                                     "normalization_api": normalization_api, "normalization_error": normalization_error})
         if normalization_api: x["normalization_api"] = normalization_api
         if normalization_error: x["normalization_error"] = normalization_error
-        for src, dst in (("paper_id", "paper_ids"), ("pmid", "pmids"), ("doi", "dois")):
-            if r.get(src): x[dst].add(r[src])
+        for s, dst in (("paper_id", "paper_ids"), ("pmid", "pmids"), ("doi", "dois")):
+            if r.get(s): x[dst].add(r[s])
+
     rows = []
-    for i, ((repo, key), x) in enumerate(grouped.items(), 1):
-        acc = x["accession"]
-        landing = TEMPLATES.get(repo, "").format(a=acc) if acc else x["raw_url"]
-        files, api, err, metadata = list_record(repo, acc) if acc else ([], "", "", {})
-        api = ";".join(v for v in (x["normalization_api"], api) if v)
-        err = "; ".join(v for v in (x["normalization_error"], err) if v)
-        rows.append({"dataset_id": f"{repo}:{acc or key}", "repository": repo, "accession": acc,
-                     "paper_ids": ";".join(sorted(x["paper_ids"])), "pmids": ";".join(sorted(x["pmids"])),
-                     "dois": ";".join(sorted(x["dois"])), "landing_url": landing,
-                     "metadata_api_url": api, "n_listed_files": len(files),
-                     "listed_files": ";".join(files), "library_strategy": metadata.get("library_strategy", ""),
-                     "library_source": metadata.get("library_source", ""), "library_layout": metadata.get("library_layout", ""),
-                     "instrument_platform": metadata.get("instrument_platform", ""), "resolve_status": "error" if err else "ok",
-                     "resolve_error": err[:500], "data_downloaded": False})
-        if api: time.sleep(args.sleep)
-        if i % 100 == 0: print(f"resolved {i}/{len(grouped)}", flush=True)
+    if args.workers <= 1:
+        for i, ((repo, key), x) in enumerate(grouped.items(), 1):
+            rows.append(resolve_one(repo, key, x))
+            if rows[-1]["metadata_api_url"]: time.sleep(args.sleep)
+            if i % 100 == 0: print(f"resolved {i}/{len(grouped)}", flush=True)
+    else:
+        with ThreadPoolExecutor(args.workers) as ex:
+            futs = {ex.submit(resolve_one, repo, key, x): 1 for (repo, key), x in grouped.items()}
+            for i, fu in enumerate(as_completed(futs), 1):
+                rows.append(fu.result())
+                if i % 100 == 0: print(f"resolved {i}/{len(grouped)}", flush=True)
 
     # MGnify shortcut: a BioProject that only has raw reads may already have
     # a processed taxonomy-abundance table on MGnify, avoiding a pipeline
     # re-run. This never overwrites the original bioproject row -- it adds a
     # sibling dataset record so stage5 can credit either source.
-    seen_bioprojects = {r["accession"] for r in rows if r["repository"] == "bioproject" and r["accession"]}
-    for i, bp in enumerate(sorted(seen_bioprojects), 1):
-        api = f"https://www.ebi.ac.uk/metagenomics/api/v1/studies?bioproject={bp}"
-        d, err = get_json(api)
-        for it in (d or {}).get("data", []):
-            mgys = it.get("id", "")
-            if not mgys:
-                continue
-            src_row = next(r for r in rows if r["repository"] == "bioproject" and r["accession"] == bp)
-            files, mapi, merr, _ = list_record("mgnify_study", mgys)
-            rows.append({"dataset_id": f"mgnify_from_bioproject:{mgys}", "repository": "mgnify_study",
-                        "accession": mgys, "paper_ids": src_row["paper_ids"], "pmids": src_row["pmids"],
-                        "dois": src_row["dois"], "landing_url": TEMPLATES["mgnify_study"].format(a=mgys),
-                        "metadata_api_url": f"{api};{mapi}", "n_listed_files": len(files),
-                        "listed_files": ";".join(files), "library_strategy": "", "library_source": "",
-                        "library_layout": "", "instrument_platform": "",
-                        "resolve_status": "error" if (err or merr) else "ok",
-                        "resolve_error": "; ".join(v for v in (err, merr) if v)[:500],
-                        "data_downloaded": False})
-        time.sleep(args.sleep)
-        if i % 50 == 0: print(f"mgnify-checked {i}/{len(seen_bioprojects)} bioprojects", flush=True)
+    seen_bioprojects = sorted({r["accession"] for r in rows if r["repository"] == "bioproject" and r["accession"]})
+    by_bp = {r["accession"]: r for r in rows if r["repository"] == "bioproject"}
+    if args.workers <= 1:
+        for i, bp in enumerate(seen_bioprojects, 1):
+            rows.extend(mgnify_lookup_one(bp, by_bp[bp]))
+            time.sleep(args.sleep)
+            if i % 50 == 0: print(f"mgnify-checked {i}/{len(seen_bioprojects)} bioprojects", flush=True)
+    else:
+        with ThreadPoolExecutor(args.workers) as ex:
+            futs = {ex.submit(mgnify_lookup_one, bp, by_bp[bp]): bp for bp in seen_bioprojects}
+            for i, fu in enumerate(as_completed(futs), 1):
+                rows.extend(fu.result())
+                if i % 50 == 0: print(f"mgnify-checked {i}/{len(seen_bioprojects)} bioprojects", flush=True)
 
     out = Path(args.outdir) / "datasets_master.csv"
     out.parent.mkdir(parents=True, exist_ok=True)

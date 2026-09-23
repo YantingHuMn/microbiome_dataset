@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""extract accessions, data URLs and availability text from papers."""
+"""extract accessions, data URLs and availability text from papers.
+
+--workers > 1 fetches multiple papers' PMC full text concurrently (this
+stage is network-latency bound, not CPU bound: each paper is an
+independent HTTP fetch + local regex pass). A shared per-host Throttle
+(_netutil.py) keeps every worker thread paced to the SAME per-host rate
+regardless of --workers, so raising --workers shortens wall-clock time by
+overlapping wait time across papers, without hitting Europe PMC harder
+per second than a single worker would.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,10 +16,15 @@ import csv
 import html
 import json
 import re
+import sys
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
 UA = {"User-Agent": "microbiome-paper-link-extractor/1.0 (academic research)"}
 BIOPROJECT_NUM = re.compile(r"(?:\bbioproject\s*#?\s*|https?://(?:www\.)?ncbi\.nlm\.nih\.gov/bioproject/)(\d{4,10})\b", re.I)
@@ -56,6 +70,7 @@ def fetch_xml(pmcid: str, cache: Path) -> str:
     if p.exists(): return p.read_text(encoding="utf-8", errors="replace")
     url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
     try:
+        GLOBAL_THROTTLE.wait(url)
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90) as r:
             txt = r.read().decode("utf-8", "replace")
         p.write_text(txt, encoding="utf-8"); return txt
@@ -77,58 +92,81 @@ def xml_text_and_availability(raw: str) -> tuple[str, str]:
     return full, " | ".join(sections)[:20000]
 
 
+def process_paper(r: dict, cache: Path) -> tuple[dict, list[dict]]:
+    """Everything for one paper: fetch full text, extract links. Independent
+    across papers -- this is the unit of work handed to worker threads."""
+    links = []
+    raw = fetch_xml(r.get("pmcid", ""), cache) if r.get("pmcid") else ""
+    full, availability = xml_text_and_availability(raw)
+    search_text = " ".join([r.get("title", ""), r.get("abstract", ""), full])
+    seen = set()
+    for repo, rx in PATTERNS:
+        for m in rx.finditer(search_text):
+            acc = m.group(1).upper() if repo not in {"zenodo", "figshare", "dryad", "mendeley", "osf", "github"} else m.group(1)
+            if repo == "github" and acc.lower() in GITHUB_TOOL_DENYLIST:
+                continue
+            key = (repo, acc)
+            if key not in seen:
+                seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": repo,
+                    "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext" if raw else "abstract"})
+    if r.get("pmcid"):
+        key = ("europepmc_supp", r["pmcid"])
+        if key not in seen:
+            seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "europepmc_supp",
+                "accession": r["pmcid"], "raw_url": "", "link_type": "accession", "source": "pmcid"})
+    for m in BIOPROJECT_NUM.finditer(html.unescape(raw)):
+        acc = m.group(1)
+        key = ("bioproject", acc)
+        if key not in seen:
+            seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "bioproject",
+                "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext"})
+    for u in URL_RE.findall(html.unescape(raw)):
+        u = u.rstrip('.,;)\\"]')
+        if DATA_HOST.search(u) and ("url", u) not in seen:
+            seen.add(("url", u)); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "url",
+                "accession": "", "raw_url": u, "link_type": "data_url", "source": "fulltext"})
+    rr = dict(r); rr.update({"fulltext_available": bool(raw), "data_availability_text": availability,
+                            "n_data_links": len(seen)})
+    return rr, links
+
+
 def main() -> None:
     base = Path(__file__).resolve().parent / "results"
     ap = argparse.ArgumentParser()
     ap.add_argument("--papers", default=str(base / "stage2_screen/papers_screened.csv"))
     ap.add_argument("--outdir", required=True, help="Directory for stage 3 outputs and PMC XML cache")
     ap.add_argument("--statuses", default="likely_relevant,manual_review")
-    ap.add_argument("--sleep", type=float, default=0.15)
+    ap.add_argument("--sleep", type=float, default=0.15,
+                    help="ignored when --workers > 1 -- the shared Throttle paces requests instead")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel papers in flight. Each worker still hits any one host no "
+                         "faster than a single worker would (see _netutil.Throttle); raising this "
+                         "mainly overlaps wait time across DIFFERENT papers/hosts. 8-16 is reasonable.")
     args = ap.parse_args()
     outdir = Path(args.outdir)
     cache = outdir / "cache" / "pmc_xml"
     wanted = set(args.statuses.split(",")); cache.mkdir(parents=True, exist_ok=True)
+    rows = [r for r in csv.DictReader(open(args.papers, newline="", encoding="utf-8"))
+           if r.get("screen_status") in wanted]
+
     links, paper_rows = [], []
-    for i, r in enumerate(csv.DictReader(open(args.papers, newline="", encoding="utf-8")), 1):
-        if r.get("screen_status") not in wanted: continue
-        raw = fetch_xml(r.get("pmcid", ""), cache) if r.get("pmcid") else ""
-        full, availability = xml_text_and_availability(raw)
-        search_text = " ".join([r.get("title", ""), r.get("abstract", ""), full])
-        seen = set()
-        for repo, rx in PATTERNS:
-            for m in rx.finditer(search_text):
-                acc = m.group(1).upper() if repo not in {"zenodo", "figshare", "dryad", "mendeley", "osf", "github"} else m.group(1)
-                if repo == "github" and acc.lower() in GITHUB_TOOL_DENYLIST:
-                    continue
-                key = (repo, acc)
-                if key not in seen:
-                    seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
-                        "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": repo,
-                        "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext" if raw else "abstract"})
-        if r.get("pmcid"):
-            key = ("europepmc_supp", r["pmcid"])
-            if key not in seen:
-                seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
-                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "europepmc_supp",
-                    "accession": r["pmcid"], "raw_url": "", "link_type": "accession", "source": "pmcid"})
-        for m in BIOPROJECT_NUM.finditer(html.unescape(raw)):
-            acc = m.group(1)
-            key = ("bioproject", acc)
-            if key not in seen:
-                seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
-                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "bioproject",
-                    "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext"})
-        for u in URL_RE.findall(html.unescape(raw)):
-            u = u.rstrip('.,;)\\"]')
-            if DATA_HOST.search(u) and ("url", u) not in seen:
-                seen.add(("url", u)); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
-                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "url",
-                    "accession": "", "raw_url": u, "link_type": "data_url", "source": "fulltext"})
-        rr = dict(r); rr.update({"fulltext_available": bool(raw), "data_availability_text": availability,
-                                "n_data_links": len(seen)})
-        paper_rows.append(rr)
-        if i % 100 == 0: print(f"processed {i}", flush=True)
-        if raw: time.sleep(args.sleep)
+    if args.workers <= 1:
+        for i, r in enumerate(rows, 1):
+            rr, ls = process_paper(r, cache)
+            paper_rows.append(rr); links.extend(ls)
+            if i % 100 == 0: print(f"processed {i}/{len(rows)}", flush=True)
+            if rr["fulltext_available"]: time.sleep(args.sleep)
+    else:
+        with ThreadPoolExecutor(args.workers) as ex:
+            futs = {ex.submit(process_paper, r, cache): r for r in rows}
+            for i, fu in enumerate(as_completed(futs), 1):
+                rr, ls = fu.result()
+                paper_rows.append(rr); links.extend(ls)
+                if i % 100 == 0: print(f"processed {i}/{len(rows)}", flush=True)
     out = outdir / "paper_data_links.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     fields = ["paper_id", "pmid", "pmcid", "doi", "repository", "accession", "raw_url", "link_type", "source"]

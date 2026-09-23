@@ -51,6 +51,49 @@ Supporting/audit files (not the deliverable, but the trail behind it):
 - `abundance_long.tsv.gz`: full long-format table (`paper_id, dataset_id, sample_id, taxon, kingdom..species, value, value_type, pipeline_source, domain, source_file`) behind every row of `abundance_final.csv`.
 - `matrices/<dataset_id>__matrix.tsv`: one taxa x sample matrix per verified dataset, built from the long table at the end of the run (never held in memory during downloading).
 
+## Speed: `--workers`
+
+Stages 1, 3, 4, and 6 spend nearly all their time waiting on HTTP requests,
+not computing -- that's what `--workers N` parallelises (a thread pool, not
+multiprocessing: no benefit to separate processes for I/O-bound waiting,
+and multiprocessing would only add memory overhead). `--sleep` is ignored
+once `--workers > 1`; pacing is handled instead by `_netutil.py`'s
+`Throttle`, which enforces one minimum interval **per hostname**, shared
+across every worker thread. That means raising `--workers` overlaps the
+wait time of DIFFERENT papers/accessions/datasets (which usually also hit
+different hosts), but never sends more requests per second to any ONE host
+than a single worker would -- so turning this up does not risk getting
+throttled or banned the way naive unthrottled concurrency would.
+
+What differs per stage:
+- **stage1**: parallelises across different search queries. Pagination
+  *within* one query stays sequential (each page's cursor depends on the
+  previous page), so parallelism here scales with the number of queries.
+- **stage3**: parallelises across papers (each paper's PMC fetch + regex
+  extraction is independent).
+- **stage4**: parallelises across resolved accessions and, separately,
+  the MGnify-from-BioProject lookups.
+- **stage6**: parallelises across datasets -- **and this is the one place
+  concurrency also multiplies resource use**, not just wall-clock. Every
+  worker still follows the same download-one-file / sniff / delete /
+  gc.collect() discipline for its own dataset (see the file's docstring),
+  so peak disk under `--scratch` and peak memory both scale roughly as
+  `--workers x --max-study-mb`, not the whole run's total. Pick `--workers`
+  so that product stays comfortably under your node's actual free scratch
+  space and `--mem`, e.g. `--max-study-mb 500 --workers 8` wants ~4 GB of
+  scratch headroom, not more. `submit_all_steps.sh` sets `WORKERS=8` and
+  `--cpus-per-task=8` to match; turn both down together if you're on a
+  smaller allocation.
+
+Start with `--workers 1` (the old serial behavior) if you've never run a
+stage against a given API before, confirm it isn't erroring/throttling,
+then raise `--workers`. If an API starts returning errors under
+concurrency despite the per-host pacing, RAISE that host's entry in
+`HOST_MIN_INTERVAL` in `_netutil.py` (a bigger number means a longer wait
+between requests to that host, i.e. more conservative) -- this protects
+the serial (`--workers 1`) case too, so it is the right fix even if you
+also lower `--workers` as a stopgap.
+
 ## Manual allowlist workflow
 
 Use `Database/results/stage1_papers/manual_whitelist.tsv` for papers that are valid but missed by the automated query logic. Each run of `stage1_search_papers.py` loads this file and unions its records into `papers_master.csv` before writing the final CSV. To add a new paper later, append a new TSV row with the same columns as the master CSV and rerun the stage.

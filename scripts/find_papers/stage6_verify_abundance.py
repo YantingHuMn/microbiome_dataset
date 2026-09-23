@@ -9,13 +9,30 @@ could not, or should not, resolve from filenames alone.
 
 Memory/disk discipline (this is the point of splitting stage6 out):
   - one dataset is downloaded, sniffed, normalised, and its raw bytes
-    deleted before the next dataset starts -- peak disk usage is bounded by
-    ONE study's supplementary/deposit size, not the sum of all of them.
+    deleted before that dataset's task ends -- peak disk usage per unit of
+    work is bounded by ONE study's supplementary/deposit size, not the sum
+    of all of them.
   - long-format rows are appended to disk immediately after each dataset,
     never accumulated in memory across the whole run.
   - a --max-file-mb and --max-study-mb budget skips anything oversized
     rather than filling the disk.
   - gc.collect() after every dataset to drop pandas/zipfile intermediates.
+
+Speed (--workers): this stage is network-latency bound, not CPU bound --
+most of the wall-clock time is spent waiting on a download, not parsing
+it. --workers N runs N datasets concurrently in a thread pool; every
+worker still follows the exact discipline above for ITS OWN dataset, so
+raising --workers scales peak disk/memory roughly as N x --max-study-mb,
+not unboundedly -- pick N so that stays under your node's actual free
+scratch space and RAM (e.g. --max-study-mb 500 --workers 8 wants a scratch
+volume that can hold ~4 GB comfortably, not the whole corpus). Concurrent
+requests to any ONE host (Zenodo, figshare, EBI, ...) are still paced to
+the same per-host rate as a single worker -- see _netutil.Throttle --
+so --workers shortens wall-clock time by overlapping DIFFERENT hosts'
+latency, it does not hit any one API harder. Writes to the shared
+abundance_long.tsv.gz are serialised with a lock; each worker's own
+downloaded files never collide since they live under
+scratch/<dataset_id>/.
 
 Usage
 -----
@@ -23,7 +40,8 @@ Usage
         --datasets  Database/results/stage5_final/dataset_candidates_final.csv \\
         --papers    Database/results/stage5_final/paper_candidates_final.csv \\
         --outdir    Database/results/stage6_verified \\
-        --scratch   /scratch/$USER/mb_stage6   # fast local disk, NOT $HOME
+        --scratch   /scratch/$USER/mb_stage6 \\
+        --workers   8   # fast/local scratch disk with room for ~8 x --max-study-mb/mb_stage6   # fast local disk, NOT $HOME
 
 Outputs (outdir)
 -----------------
@@ -62,11 +80,16 @@ import json
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.request
 import zipfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
 csv.field_size_limit(sys.maxsize)
 UA = {"User-Agent": "microbiome-dataset-verifier/1.0 (academic research)"}
@@ -141,6 +164,7 @@ def stream_download(url: str, dest: Path, max_mb: float) -> tuple[bool, str]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     try:
+        GLOBAL_THROTTLE.wait(url)
         req = urllib.request.Request(url, headers=UA)
         with urllib.request.urlopen(req, timeout=300) as r:
             cl = r.headers.get("Content-Length")
@@ -173,8 +197,10 @@ def list_deposit_files(repo: str, acc: str) -> list[tuple[str, str, int]]:
         return [(f"{acc}_supplementary.zip", LIST_APIS["europepmc_supp"](acc), 0)]
     if repo not in LIST_APIS:
         return []
+    api_url = LIST_APIS[repo](acc)
     try:
-        with ur.urlopen(ur.Request(LIST_APIS[repo](acc), headers=UA), timeout=90) as r:
+        GLOBAL_THROTTLE.wait(api_url)
+        with ur.urlopen(ur.Request(api_url, headers=UA), timeout=90) as r:
             d = json.loads(r.read())
     except Exception:                                # noqa: BLE001
         return []
@@ -402,7 +428,8 @@ def to_long_rows(d, verdict: dict, paper_id: str, dataset_id: str, source_file: 
 # --------------------------------------------------------------------------- #
 
 def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: float,
-                   long_path: Path, matrices_dir: Path) -> dict:
+                   long_path: Path, matrices_dir: Path,
+                   long_lock: threading.Lock | None = None) -> dict:
     repo, acc, dsid = row["repository"], row["accession"], row["dataset_id"]
     paper_ids = row.get("paper_ids", "")
     study_dir = scratch / re.sub(r"[^A-Za-z0-9._-]", "_", dsid)[:100]
@@ -442,9 +469,15 @@ def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: f
                                          dsid, f"{name}!{sub_id}")
                 if not long_rows.empty:
                     long_rows["pipeline_source"] = pipe
-                    write_header = not long_path.exists()
-                    long_rows.to_csv(long_path, sep="\t", index=False, mode="a",
-                                     header=write_header, compression="gzip" if long_path.suffix == ".gz" else None)
+                    # check-exists + append must be atomic across worker
+                    # threads, or two datasets writing "first ever" rows at
+                    # the same moment can both see "no file yet" and both
+                    # write a header row into the same gzip stream.
+                    lock_ctx = long_lock if long_lock is not None else threading.Lock()
+                    with lock_ctx:
+                        write_header = not long_path.exists()
+                        long_rows.to_csv(long_path, sep="\t", index=False, mode="a",
+                                         header=write_header, compression="gzip" if long_path.suffix == ".gz" else None)
                     n_rows_written += len(long_rows)
                 verdicts.append({"file": f"{name}!{sub_id}", "verdict": "accepted" if not v["needs_review"] else "needs_review",
                                  "axis": v.get("axis", ""), "value_type": v.get("value_type", ""),
@@ -481,7 +514,15 @@ def main() -> None:
     ap.add_argument("--statuses", default="abundance_ready,needs_content_check")
     ap.add_argument("--max-file-mb", type=float, default=200)
     ap.add_argument("--max-study-mb", type=float, default=500)
-    ap.add_argument("--sleep", type=float, default=0.2)
+    ap.add_argument("--sleep", type=float, default=0.2,
+                    help="ignored when --workers > 1 -- the shared Throttle paces requests instead")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel datasets downloaded/verified at once. Each worker still follows "
+                         "the same download-one-file -> sniff -> delete -> gc.collect() discipline "
+                         "per dataset, so peak disk/memory scales as roughly workers x max-study-mb "
+                         "rather than accumulating across the whole run. 4-8 is reasonable; do not "
+                         "set this anywhere near --max-study-mb x workers > your node's actual free "
+                         "disk under --scratch.")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -491,6 +532,7 @@ def main() -> None:
     matrices_dir = outdir / "matrices"
     long_path = outdir / "abundance_long.tsv.gz"
     verif_path = outdir / "dataset_verification.csv"
+    long_lock = threading.Lock()  # guards the shared abundance_long.tsv.gz across worker threads
 
     wanted = set(args.statuses.split(","))
     datasets = [r for r in csv.DictReader(open(args.datasets, newline="", encoding="utf-8"))
@@ -501,6 +543,7 @@ def main() -> None:
     if verif_path.exists():
         done_ids = {r["dataset_id"] for r in csv.DictReader(open(verif_path, newline="", encoding="utf-8"))}
         print(f"resuming: {len(done_ids)} datasets already verified")
+    pending = [row for row in datasets if row["dataset_id"] not in done_ids]
 
     fieldnames = ["dataset_id", "content_verified", "n_tables_checked",
                  "n_tables_accepted", "n_rows_written", "data_category",
@@ -510,17 +553,34 @@ def main() -> None:
     if verif_path.stat().st_size == 0:
         w.writeheader()
 
-    for i, row in enumerate(datasets, 1):
-        if row["dataset_id"] in done_ids:
-            continue
-        result = verify_dataset(row, scratch, args.max_file_mb, args.max_study_mb,
-                                long_path, matrices_dir)
-        w.writerow({k: result.get(k, "") for k in fieldnames})
-        fh.flush()
-        if i % 20 == 0:
-            print(f"verified {i}/{len(datasets)} (disk under {scratch} should be near-empty between rows)",
-                 flush=True)
-        time.sleep(args.sleep)
+    if args.workers <= 1:
+        for i, row in enumerate(pending, 1):
+            result = verify_dataset(row, scratch, args.max_file_mb, args.max_study_mb,
+                                    long_path, matrices_dir, long_lock)
+            w.writerow({k: result.get(k, "") for k in fieldnames})
+            fh.flush()
+            if i % 20 == 0:
+                print(f"verified {i}/{len(pending)} (disk under {scratch} should be near-empty between rows)",
+                     flush=True)
+            time.sleep(args.sleep)
+    else:
+        # Every worker downloads its OWN dataset into scratch/<dataset_id>/
+        # (verify_dataset derives that subdirectory from dataset_id, so
+        # concurrent workers never share a path) and deletes it before
+        # returning -- peak scratch usage is bounded by
+        # (in-flight workers) x max-study-mb, not the whole queue.
+        with ThreadPoolExecutor(args.workers) as ex:
+            futs = {ex.submit(verify_dataset, row, scratch, args.max_file_mb, args.max_study_mb,
+                              long_path, matrices_dir, long_lock): row["dataset_id"]
+                   for row in pending}
+            for i, fu in enumerate(as_completed(futs), 1):
+                result = fu.result()
+                w.writerow({k: result.get(k, "") for k in fieldnames})
+                fh.flush()
+                if i % 20 == 0:
+                    print(f"verified {i}/{len(pending)} ({args.workers} workers, "
+                         f"disk under {scratch} bounded by ~{args.workers}x --max-study-mb)",
+                         flush=True)
     fh.close()
 
     # roll up to paper level: a paper is "processed" if ANY of its datasets
