@@ -13,8 +13,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 UA = {"User-Agent": "microbiome-paper-link-extractor/1.0 (academic research)"}
+BIOPROJECT_NUM = re.compile(r"(?:\bbioproject\s*#?\s*|https?://(?:www\.)?ncbi\.nlm\.nih\.gov/bioproject/)(\d{4,10})\b", re.I)
 PATTERNS = [
     ("bioproject", re.compile(r"\b(PRJ(?:NA|EB|DB|DA|CA)\d{4,10})\b", re.I)),
+    ("bioproject", BIOPROJECT_NUM),
     ("sra_study", re.compile(r"\b([SED]RP\d{5,12})\b", re.I)),
     ("sra_run", re.compile(r"\b([SED]RR\d{5,12})\b", re.I)),
     ("sra_experiment", re.compile(r"\b([SED]RX\d{5,12})\b", re.I)),
@@ -87,6 +89,13 @@ def main() -> None:
                     seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
                         "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": repo,
                         "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext" if raw else "abstract"})
+        for m in BIOPROJECT_NUM.finditer(html.unescape(raw)):
+            acc = m.group(1)
+            key = ("bioproject", acc)
+            if key not in seen:
+                seen.add(key); links.append({"paper_id": r["paper_id"], "pmid": r.get("pmid", ""),
+                    "pmcid": r.get("pmcid", ""), "doi": r.get("doi", ""), "repository": "bioproject",
+                    "accession": acc, "raw_url": "", "link_type": "accession", "source": "fulltext"})
         for u in URL_RE.findall(html.unescape(raw)):
             u = u.rstrip('.,;)\\"]')
             if DATA_HOST.search(u) and ("url", u) not in seen:

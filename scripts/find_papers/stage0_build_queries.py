@@ -30,8 +30,10 @@ ASSAY = {
     ],
     "shotgun": [
         '"shotgun metagenomics"',
+        '"shotgun metagenomic"',
+        '"shotgun metagenomic sequencing"',
         '"whole metagenome sequencing"',
-        "metagenomic"
+        '"metagenomic sequencing"'
     ],
     "virome": [
         '"virome sequencing"',
@@ -60,20 +62,13 @@ PRODUCT = [
     "BIOM"
 ]
 
-RAW_DATA = [
-    "FASTQ",
-    '"raw reads"',
-    '"sequencing reads"',
-    '"Sequence Read Archive"',
-    "SRA",
-    "ENA",
-    "BioProject",
-    "BioSample"
-]
-
 
 def joined(xs: list[str]) -> str:
     return "(" + " OR ".join(xs) + ")"
+
+
+def field_joined(xs: list[str], field: str) -> str:
+    return "(" + " OR ".join(f"{field}:{x}" for x in xs) + ")"
 
 
 def main() -> None:
@@ -111,8 +106,8 @@ def main() -> None:
                 microbe,
                 assay,
                 "assay",
-                f"{joined(object_terms)} AND "
-                f"{joined(assay_terms)} "
+                f"{field_joined(object_terms, 'TITLE_ABS')} AND "
+                f"{field_joined(assay_terms, 'TITLE_ABS')} "
                 f"{args.extra_filter}".strip()
             ))
 
@@ -121,18 +116,8 @@ def main() -> None:
             microbe,
             "unspecified",
             "processed",
-            f"{joined(object_terms)} AND "
-            f"{joined(PRODUCT)} "
-            f"{args.extra_filter}".strip()
-        ))
-
-        rows.append((
-            f"{microbe}_raw_data",
-            microbe,
-            "unspecified",
-            "raw_data",
-            f"{joined(object_terms)} AND "
-            f"{joined(RAW_DATA)} "
+            f"{field_joined(object_terms, 'TITLE_ABS')} AND "
+            f"{field_joined(PRODUCT, 'TITLE_ABS')} "
             f"{args.extra_filter}".strip()
         ))
 

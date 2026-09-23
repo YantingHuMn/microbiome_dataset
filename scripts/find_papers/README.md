@@ -15,9 +15,14 @@ This directory contains a **pre-download** pipeline for discovering papers and p
 ## Principal outputs
 
 - `papers_master.csv`: all unique discovered papers.
+- `manual_whitelist.tsv`: manual additions that should always be included even when the strict keyword search misses them.
 - `papers_screened.csv`: initial relevance and assay classification.
 - `paper_data_links.csv`: one row per paper/accession or external data URL.
 - `datasets_master.csv`: canonical repository records and potential download locations.
 - `paper_candidates_final.csv`: final paper-level triage.
 - `dataset_candidates_final.csv`: final dataset-level triage.
 - `abundance_ready.csv`, `raw_reads_ready.csv`, `manual_review.csv`: actionable subsets.
+
+## Manual allowlist workflow
+
+Use `Database/results/stage1_papers/manual_whitelist.tsv` for papers that are valid but missed by the automated query logic. Each run of `stage1_search_papers.py` loads this file and unions its records into `papers_master.csv` before writing the final CSV. To add a new paper later, append a new TSV row with the same columns as the master CSV and rerun the stage.

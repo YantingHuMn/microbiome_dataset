@@ -1,0 +1,2 @@
+paper_id	doi	pmid	pmcid	title	abstract	journal	publication_year	publication_type	is_open_access	cited_by_count	discovery_source	matched_queries	microbe_scope_hint	assay_group_hint	note
+10.1038/s41564-018-0306-4	10.1038/s41564-018-0306-4	30531976	PMC6342642	Gut microbiome structure and metabolic activity in inflammatory bowel disease		Nature Microbiology	2018				manual_whitelist	manual_whitelist	bacteria	amplicon	Manually included because it matches the microbiome topic but is absent from strict keyword-driven Europe PMC search results.
