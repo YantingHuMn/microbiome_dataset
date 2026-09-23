@@ -2,8 +2,7 @@
 #SBATCH --job-name=virusDB
 #SBATCH --partition=interact
 #SBATCH --time=8:00:00
-#SBATCH --mem=4G   # NOTE: stage6_verify_abundance.py opens xlsx/zip files with pandas;
-                    # if it OOMs, bump this -- 8-16G is a safer starting point once stage6 is included.
+#SBATCH --mem=16G
 #SBATCH --output=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_all_steps.out
 #SBATCH --error=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_all_steps.err
 #SBATCH --mail-user=yanting@unc.edu
@@ -47,10 +46,6 @@ python "${READ_DIR}/stage5_classify_candidates.py" \
     --datasets "${OUT_DIR}/stage4_datasets/datasets_master.csv" \
     --outdir "${OUT_DIR}/stage5_final"
 
-# stage6 is the one stage that downloads files. Point --scratch at fast
-# LOCAL/scratch disk, not $HOME or $OUT_DIR on network storage -- it is
-# emptied automatically as each dataset finishes, but heavy churn on a
-# network filesystem is still slow and, on some clusters, quota-limited.
 python "${READ_DIR}/stage6_verify_abundance.py" \
     --datasets "${OUT_DIR}/stage5_final/dataset_candidates_final.csv" \
     --papers "${OUT_DIR}/stage5_final/paper_candidates_final.csv" \

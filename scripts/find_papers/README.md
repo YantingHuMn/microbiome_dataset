@@ -40,13 +40,14 @@ Stage 0-5 (listing only):
 - `paper_candidates_final.csv` / `dataset_candidates_final.csv`: final paper-/dataset-level triage, now carrying `data_category` (`processed`/`raw_reads`/`unknown`) and `source_pipeline_hint`.
 - `abundance_ready.csv`, `raw_reads_ready.csv`, `needs_content_check.csv`, `manual_review.csv`: actionable subsets.
 
-Stage 6 (opens files, content-verified) -- the two deliverables:
+Stage 6 (opens files, content-verified) -- the three deliverables:
 - **`abundance_final.csv`**: papers with >=1 content-verified abundance matrix. `data_category=processed`, `source_pipeline` names the tool (QIIME2/mothur/DADA2/Kraken2-Bracken/MetaPhlAn/...) where recoverable. Nothing left to do with these.
-- **`needs_pipeline_or_review.csv`**: everything else. `next_action` tells the two remaining cases apart inside this one file: `run_own_pipeline` (only raw reads are public -- run your 16S/metagenomics pipeline) or `manual_content_review` (a table-shaped file exists but neither the filename nor the content check settled whether it's an abundance matrix -- open it yourself).
+- **`run_own_pipeline.csv`**: papers whose `next_action=run_own_pipeline`; only raw reads are public, so run your 16S/metagenomics pipeline.
+- **`manual_content_review.csv`**: papers whose `next_action=manual_content_review`; a table-shaped file exists but neither the filename nor the automated content check settled whether it is an abundance matrix, so it must be opened manually.
 
 Supporting/audit files (not the deliverable, but the trail behind it):
 - `dataset_verification.csv`: one row per dataset actually opened -- `content_verified`, `n_tables_checked/accepted`, `data_category`, `pipeline_source`, and a JSON `note` with the per-file verdicts.
-- `paper_verification.csv`: every column from `paper_candidates_final.csv` plus the stage6 verdict, before the abundance_final / needs_pipeline_or_review split.
+- `paper_verification.csv`: every column from `paper_candidates_final.csv` plus the stage6 verdict, before the three-way deliverable split. Cases with other actions such as `no_data_found` remain visible here rather than being mixed into either action queue.
 - `abundance_long.tsv.gz`: full long-format table (`paper_id, dataset_id, sample_id, taxon, kingdom..species, value, value_type, pipeline_source, domain, source_file`) behind every row of `abundance_final.csv`.
 - `matrices/<dataset_id>__matrix.tsv`: one taxa x sample matrix per verified dataset, built from the long table at the end of the run (never held in memory during downloading).
 

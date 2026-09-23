@@ -36,11 +36,11 @@ Outputs (outdir)
                                 next_action -- every column, every paper.
     abundance_final.csv        DELIVERABLE 1: papers with >=1 content-verified
                                 abundance matrix. Nothing left to do.
-    needs_pipeline_or_review.csv  DELIVERABLE 2: everything else -- raw reads
-                                waiting on your own pipeline (next_action=
-                                run_own_pipeline) or ambiguous cases needing a
-                                human to open the file (next_action=
-                                manual_content_review).
+    run_own_pipeline.csv        DELIVERABLE 2: papers for which only raw reads
+                                are available (next_action=run_own_pipeline).
+    manual_content_review.csv   DELIVERABLE 3: ambiguous cases that still need
+                                a human to open and inspect the deposited file
+                                (next_action=manual_content_review).
     abundance_long.tsv.gz      full long-format table (paper_id, dataset_id,
                                 sample_id, taxon, kingdom..species, value,
                                 value_type, domain) -- append-only during the run.
@@ -565,23 +565,25 @@ def main() -> None:
     pfields = list(papers[0]) if papers else []
 
     # Full audit trail (every paper, every column) -- keep this even though
-    # the two files below are the actual deliverable, since it's the only
+    # the three files below are the actual deliverables, since it's the only
     # place n_linked_datasets / dataset_ids / classification_reason survive.
     with open(outdir / "paper_verification.csv", "w", newline="", encoding="utf-8") as f:
         wcsv = csv.DictWriter(f, fieldnames=pfields); wcsv.writeheader(); wcsv.writerows(papers)
 
-    # THE TWO DELIVERABLE FILES.
+    # THE THREE DELIVERABLE FILES. The two unresolved actions are deliberately
+    # separate so downstream work does not need to filter a mixed queue.
     # 1. abundance_final.csv: content-verified matrix in hand, nothing left to do.
     with open(outdir / "abundance_final.csv", "w", newline="", encoding="utf-8") as f:
         wcsv = csv.DictWriter(f, fieldnames=pfields); wcsv.writeheader()
         wcsv.writerows([p for p in papers if p["content_verified"]])
-    # 2. needs_pipeline_or_review.csv: everything else -- raw reads waiting on
-    #    your own pipeline, AND papers whose data type is still ambiguous and
-    #    needs a human to open the file. `next_action` tells the two apart
-    #    inside this one file rather than splitting it further.
-    with open(outdir / "needs_pipeline_or_review.csv", "w", newline="", encoding="utf-8") as f:
+    # 2. run_own_pipeline.csv: public raw reads that need our pipeline.
+    with open(outdir / "run_own_pipeline.csv", "w", newline="", encoding="utf-8") as f:
         wcsv = csv.DictWriter(f, fieldnames=pfields); wcsv.writeheader()
-        wcsv.writerows([p for p in papers if not p["content_verified"]])
+        wcsv.writerows([p for p in papers if p["next_action"] == "run_own_pipeline"])
+    # 3. manual_content_review.csv: unresolved table/file content for a human.
+    with open(outdir / "manual_content_review.csv", "w", newline="", encoding="utf-8") as f:
+        wcsv = csv.DictWriter(f, fieldnames=pfields); wcsv.writeheader()
+        wcsv.writerows([p for p in papers if p["next_action"] == "manual_content_review"])
 
     # per-dataset matrices, built from the long table without holding it all
     # in memory: read the tsv.gz in chunks, spool one accumulator per dataset.
@@ -602,8 +604,11 @@ def main() -> None:
 
     shutil.rmtree(scratch, ignore_errors=True)
     n_final = sum(p["content_verified"] for p in papers)
+    n_pipeline = sum(p["next_action"] == "run_own_pipeline" for p in papers)
+    n_review = sum(p["next_action"] == "manual_content_review" for p in papers)
     print(f"done. {n_final}/{len(papers)} papers -> abundance_final.csv; "
-          f"{len(papers) - n_final} -> needs_pipeline_or_review.csv")
+          f"{n_pipeline} -> run_own_pipeline.csv; "
+          f"{n_review} -> manual_content_review.csv")
 
 
 if __name__ == "__main__":
