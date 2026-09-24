@@ -26,6 +26,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
+csv.field_size_limit(sys.maxsize)  # data_availability_text can exceed the 131072-byte default
+
 UA = {"User-Agent": "microbiome-paper-link-extractor/1.0 (academic research)"}
 BIOPROJECT_NUM = re.compile(r"(?:\bbioproject\s*#?\s*|https?://(?:www\.)?ncbi\.nlm\.nih\.gov/bioproject/)(\d{4,10})\b", re.I)
 PATTERNS = [

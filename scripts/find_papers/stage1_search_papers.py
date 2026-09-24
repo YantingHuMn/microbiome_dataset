@@ -15,6 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
+csv.field_size_limit(sys.maxsize)  # abstract/matched_queries can exceed the 131072-byte default
+
 API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 UA = {"User-Agent": "microbiome-paper-discovery/1.0 (academic research)"}
 FIELDS = ["paper_id", "pmid", "pmcid", "doi", "title", "abstract", "journal",

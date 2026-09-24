@@ -30,6 +30,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _netutil import GLOBAL_THROTTLE  # noqa: E402
 
+csv.field_size_limit(sys.maxsize)  # listed_files can exceed the 131072-byte default
+
 UA = {"User-Agent": "microbiome-dataset-resolver/1.0 (academic research)"}
 TEMPLATES = {
     "bioproject": "https://www.ncbi.nlm.nih.gov/bioproject/{a}",
