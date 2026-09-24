@@ -53,7 +53,7 @@ MAX_SUPP_ZIP_MB = 300  # abandon a listing if the supplementary bundle is absurd
 def get_json(url: str) -> tuple[dict | list | None, str]:
     try:
         GLOBAL_THROTTLE.wait(url)
-        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=90) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=20) as r:
             return json.loads(r.read()), ""
     except Exception as e: return None, str(e)
 
@@ -165,11 +165,21 @@ def resolve_one(repo: str, key, x: dict) -> dict:
             "resolve_error": err[:500], "data_downloaded": False}
 
 
+MGNIFY_MAX_MATCHES = 10  # a popular BioProject can link 25+ MGnify studies; listing
+                         # files for each one is a separate serial network call inside
+                         # this single worker slot -- one such BioProject observed taking
+                         # 20s (25 matches) against ~2.5s for a BioProject with none. This
+                         # lookup is a best-effort shortcut, not required for correctness,
+                         # so cap it rather than let a handful of popular BioProjects blow
+                         # up the whole pass's tail latency.
+
+
 def mgnify_lookup_one(bp: str, src_row: dict) -> list[dict]:
     api = f"https://www.ebi.ac.uk/metagenomics/api/v1/studies?bioproject={bp}"
     d, err = get_json(api)
     out = []
-    for it in (d or {}).get("data", []):
+    matches = (d or {}).get("data", [])
+    for it in matches[:MGNIFY_MAX_MATCHES]:
         mgys = it.get("id", "")
         if not mgys:
             continue

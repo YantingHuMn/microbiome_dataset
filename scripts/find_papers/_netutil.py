@@ -54,6 +54,18 @@ class Throttle:
                 self._intervals[h] = 0.11
 
     def wait(self, url: str) -> None:
+        """Reserve this host's next slot, then sleep OUTSIDE the lock.
+
+        The lock only protects the bookkeeping (reading/updating
+        self._last), never the sleep itself -- sleeping while holding a
+        single process-wide lock would serialize EVERY caller, for EVERY
+        host, behind whichever thread happens to be sleeping, collapsing
+        --workers N into an accidental N=1. Each thread instead reserves
+        its own slot (self._last[host] = max(now, due)) and releases the
+        lock immediately, so concurrent callers queueing for the same
+        host get staggered wake times computed near-instantly, and
+        callers for a DIFFERENT host are never blocked by this one at all.
+        """
         host = urllib.parse.urlparse(url).netloc
         gap = self._intervals.get(host, DEFAULT_MIN_INTERVAL)
         if gap <= 0:
@@ -62,10 +74,9 @@ class Throttle:
             now = time.monotonic()
             due = self._last.get(host, 0.0) + gap
             sleep_for = due - now
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-                now = time.monotonic()
-            self._last[host] = now
+            self._last[host] = max(now, due)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
 
 # One process-wide instance is fine: stage scripts are single-process,
