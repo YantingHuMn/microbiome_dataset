@@ -502,7 +502,45 @@ def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: f
 # main
 # --------------------------------------------------------------------------- #
 
+def check_dependencies() -> None:
+    """Fail fast and loud, before touching a single dataset, if a table
+    format this stage needs to read can't actually be opened. Without this,
+    a missing package degrades silently: iter_tables()'s broad except just
+    logs "iter_tables error: ... openpyxl failed" per FILE to stderr and
+    yields zero tables for it, so every .xlsx in the run gets silently
+    scored as "no abundance matrix found" instead of "never actually
+    opened" -- indistinguishable from a real negative in the output CSVs,
+    and easy to miss in a run over tens of thousands of files. This was
+    observed for real: an entire cluster run logged nothing but per-file
+    openpyxl ImportErrors, meaning none of that run's .xlsx supplementary
+    tables (the majority format encountered in practice) were ever
+    content-checked at all.
+    """
+    missing = []
+    try:
+        import openpyxl  # noqa: F401  -- reads .xlsx
+    except ImportError:
+        missing.append(("openpyxl", ".xlsx"))
+    try:
+        import xlrd  # noqa: F401  -- reads legacy .xls
+    except ImportError:
+        missing.append(("xlrd", ".xls"))
+    if missing:
+        pkgs = " ".join(p for p, _ in missing)
+        fmts = ", ".join(f"{p} ({fmt})" for p, fmt in missing)
+        print(f"FATAL: missing required package(s) for reading spreadsheet tables: {fmts}\n"
+             f"Install into the active environment before rerunning, e.g.:\n"
+             f"    pip install {pkgs}\n"
+             f"or:\n"
+             f"    conda install -n <env> {pkgs}\n"
+             f"Running without these does not fail loudly -- every affected file is silently "
+             f"scored as \"no abundance matrix found\" instead of \"never opened\".",
+             file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
+    check_dependencies()
     base = Path(__file__).resolve().parent / "results"
     ap = argparse.ArgumentParser()
     ap.add_argument("--datasets", default=str(base / "stage5_final/dataset_candidates_final.csv"))

@@ -28,6 +28,12 @@ conda activate virus
 
 cd /hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset
 
+# stage6 needs pandas/numpy/openpyxl/xlrd to open .xlsx/.xls supplementary
+# tables; it checks for these itself and exits with a clear error if
+# missing, but installing up front avoids that failure mode entirely (this
+# is additive/idempotent -- safe to run every submission).
+pip install -q -r scripts/find_papers/requirements.txt
+
 READ_DIR="/hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/scripts/find_papers"
 OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 

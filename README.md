@@ -21,6 +21,25 @@ The planned database may include:
 - `metadata/`: Standardized study and sample metadata
 - `docs/`: Documentation
 
+## Requirements
+
+stage0-5 use only the Python standard library. stage6 (the one stage that
+opens actual spreadsheet/table files) needs `pandas`, `numpy`, `openpyxl`,
+and `xlrd` -- see `scripts/find_papers/requirements.txt`. Install them into
+whichever conda env `submit_all_steps.sh` activates (`virus` on the UNC
+cluster) BEFORE running stage6:
+
+```
+pip install -r scripts/find_papers/requirements.txt
+```
+
+stage6 also checks for these itself at startup and exits immediately with
+a clear message if any are missing, rather than continuing and silently
+mis-scoring every `.xlsx`/`.xls` file it encounters as "no abundance
+matrix found" (which is what happened before this check existed: a whole
+cluster run logged nothing but per-file openpyxl import errors and never
+actually opened any of that run's `.xlsx` supplementary tables).
+
 ## Data category
 
 Every paper the pipeline keeps lands in one of two buckets:

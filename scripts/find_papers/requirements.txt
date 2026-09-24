@@ -1,0 +1,21 @@
+# Third-party dependencies for this pipeline.
+#
+# stage0-5 use only the Python standard library by design (see comments in
+# stage6_verify_abundance.py) -- only stage6 needs anything here, because
+# it's the one stage that opens actual spreadsheet/table files.
+#
+# Install into the conda env this pipeline runs in (e.g. `virus` on the
+# UNC cluster -- see scripts/inst/submit_all_steps.sh):
+#     pip install -r requirements.txt
+# or:
+#     conda install --file requirements.txt   (channel defaults/conda-forge)
+#
+# stage6 checks for these itself at startup (check_dependencies()) and
+# exits with a clear message instead of silently mis-scoring every
+# affected file if any are missing -- but installing them ahead of a run
+# avoids that failure mode entirely.
+
+pandas>=1.5
+numpy>=1.23
+openpyxl>=3.0      # required to read .xlsx
+xlrd>=2.0          # required to read legacy .xls (NOT .xlsx)
