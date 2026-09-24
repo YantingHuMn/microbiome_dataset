@@ -19,6 +19,7 @@ import argparse
 import csv
 import io
 import json
+import re
 import sys
 import threading
 import time
@@ -103,6 +104,34 @@ def list_zip_names(url: str, max_mb: float = MAX_SUPP_ZIP_MB) -> tuple[list[str]
         return [], str(e)
 
 
+PMC_BIN_RE = re.compile(r'/articles/instance/(\d+)/bin/([^"\']+)')
+
+
+def list_pmc_associated_data(pmcid: str) -> list[str]:
+    """Filenames scraped from the live PMC article page's Associated Data
+    section. Europe PMC's supplementaryFiles zip mirrors ONE NIHMS
+    manuscript submission and can miss files from a LATER revision that
+    the live PMC page already shows -- observed directly: for PMC6342642,
+    the zip contained NIHMS80310's 14 figure/reporting-summary files,
+    while the live page's Associated Data listed NIHMS1510763's 8 xlsx
+    datasets + 2 PDFs, a completely different manuscript submission. Used
+    here to widen listed_files so stage5 doesn't miss these; stage6 has
+    the matching fetch-side fix to actually download them.
+    """
+    try:
+        GLOBAL_THROTTLE.wait(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/")
+        req = urllib.request.Request(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/", headers=UA)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html_text = r.read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    seen, names = set(), []
+    for _num, fname in PMC_BIN_RE.findall(html_text):
+        if fname not in seen:
+            seen.add(fname); names.append(fname)
+    return names
+
+
 def list_record(repo: str, acc: str) -> tuple[list[str], str, str, dict[str, str]]:
     """Return metadata file names, API endpoint, error. No deposited file content."""
     if repo == "zenodo":
@@ -114,7 +143,10 @@ def list_record(repo: str, acc: str) -> tuple[list[str], str, str, dict[str, str
     if repo == "europepmc_supp":
         api = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{acc}/supplementaryFiles"
         names, err = list_zip_names(api)
-        return names, api, err, {}
+        extra = list_pmc_associated_data(acc)
+        merged = list(dict.fromkeys(names + extra))  # union, de-duped, order-preserving
+        page_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{acc}/"
+        return merged, (f"{api};{page_url}" if extra else api), err, {}
     if repo == "dryad":
         doi_path = f"doi:10.5061/dryad.{acc}".replace("/", "%2F").replace(":", "%3A")
         api = f"https://datadryad.org/api/v2/datasets/{doi_path}"

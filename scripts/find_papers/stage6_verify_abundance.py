@@ -189,12 +189,49 @@ def stream_download(url: str, dest: Path, max_mb: float) -> tuple[bool, str]:
         return False, f"ERR:{type(e).__name__}:{e}"[:200]
 
 
+PMC_BIN_RE = re.compile(r'/articles/instance/(\d+)/bin/([^"\']+)')
+
+
+def list_pmc_associated_data(pmcid: str) -> list[tuple[str, str]]:
+    """(filename, download_url) pairs scraped from the live PMC article
+    page's Associated Data section. Europe PMC's supplementaryFiles zip
+    mirrors ONE NIHMS manuscript submission and can miss files from a
+    LATER revision the live PMC page already shows -- observed directly:
+    for PMC6342642, the zip contained NIHMS80310's 14 figure/reporting-
+    summary files, while the live page's Associated Data listed
+    NIHMS1510763's 8 xlsx datasets + 2 PDFs, a completely different
+    manuscript submission. Without this, those 8 xlsx files -- exactly
+    the kind of file this whole stage exists to open -- are never even
+    downloaded, let alone content-checked.
+    """
+    import urllib.request as ur
+    url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+    try:
+        GLOBAL_THROTTLE.wait(url)
+        with ur.urlopen(ur.Request(url, headers=UA), timeout=30) as r:
+            html_text = r.read().decode("utf-8", "replace")
+    except Exception:                                # noqa: BLE001
+        return []
+    seen, out = set(), []
+    for num, fname in PMC_BIN_RE.findall(html_text):
+        dl_url = f"https://pmc.ncbi.nlm.nih.gov/articles/instance/{num}/bin/{fname}"
+        if fname not in seen:
+            seen.add(fname); out.append((fname, dl_url))
+    return out
+
+
 def list_deposit_files(repo: str, acc: str) -> list[tuple[str, str, int]]:
     """(name, download_url, size) for one deposit. europepmc_supp returns a
-    single zip URL -- its members are discovered after download."""
+    single zip URL -- its members are discovered after download -- PLUS
+    any files found only on the live PMC page (see list_pmc_associated_data)."""
     import urllib.request as ur
     if repo == "europepmc_supp":
-        return [(f"{acc}_supplementary.zip", LIST_APIS["europepmc_supp"](acc), 0)]
+        files = [(f"{acc}_supplementary.zip", LIST_APIS["europepmc_supp"](acc), 0)]
+        seen_names = set()
+        for fname, dl_url in list_pmc_associated_data(acc):
+            if fname not in seen_names:
+                seen_names.add(fname); files.append((fname, dl_url, 0))
+        return files
     if repo not in LIST_APIS:
         return []
     api_url = LIST_APIS[repo](acc)
