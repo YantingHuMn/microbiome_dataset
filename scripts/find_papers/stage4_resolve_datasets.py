@@ -211,6 +211,14 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel accessions resolved at once. Safe to raise (8-16 is reasonable) "
                          "-- see _netutil.Throttle for why this doesn't hit any one API harder.")
+    ap.add_argument("--skip-mgnify", action="store_true",
+                    help="skip the MGnify-from-BioProject reverse lookup entirely. This pass is a "
+                         "best-effort shortcut (it can convert some raw_reads-only BioProjects into "
+                         "abundance_ready for free), NOT required for correctness -- skipped "
+                         "BioProjects simply stay classified as raw_reads/needs-own-pipeline, which "
+                         "is already a valid outcome. Even at ~5.5s/item post-fix, ~24k BioProjects "
+                         "is still ~35-40h; use this to get the main pipeline result first and run "
+                         "the MGnify pass separately later, on its own time budget.")
     args = ap.parse_args()
 
     out = Path(args.outdir) / "datasets_master.csv"
@@ -281,8 +289,17 @@ def main() -> None:
     # MGnify shortcut: a BioProject that only has raw reads may already have
     # a processed taxonomy-abundance table on MGnify, avoiding a pipeline
     # re-run. This never overwrites the original bioproject row -- it adds a
-    # sibling dataset record so stage5 can credit either source.
-    #
+    # sibling dataset record so stage5 can credit either source. Optional
+    # (--skip-mgnify): skipped BioProjects simply stay classified as
+    # raw_reads/needs-own-pipeline downstream, which is already valid.
+    if args.skip_mgnify:
+        print("skipping MGnify-from-BioProject lookup (--skip-mgnify)", flush=True)
+        fh.close()
+        with out.open(newline="", encoding="utf-8") as f2:
+            n_total = sum(1 for _ in csv.DictReader(f2))
+        print(f"done. {n_total} dataset records total -> {out}")
+        return
+
     # Resuming this pass by dataset_id alone does NOT work: a checked
     # bioproject with ZERO MGnify matches writes no output row at all, so
     # there is nothing in datasets_master.csv to prove it was ever checked

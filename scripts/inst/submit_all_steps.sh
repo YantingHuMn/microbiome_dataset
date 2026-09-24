@@ -46,10 +46,16 @@ WORKERS=8
 #     --outdir "${OUT_DIR}/stage3_links" \
 #     --workers "${WORKERS}"
 
+# --skip-mgnify skips the optional MGnify-from-BioProject reverse lookup
+# (best-effort shortcut, not required for correctness -- see
+# scripts/find_papers/README.md). Even after the speed fixes it's still
+# ~35-40h for ~24k BioProjects; comment out --skip-mgnify to run it once
+# the main pipeline result is in hand, on its own time budget.
 python "${READ_DIR}/stage4_resolve_datasets.py" \
     --links "${OUT_DIR}/stage3_links/paper_data_links.csv" \
     --outdir "${OUT_DIR}/stage4_datasets" \
-    --workers "${WORKERS}"
+    --workers "${WORKERS}" \
+    --skip-mgnify
 
 python "${READ_DIR}/stage5_classify_candidates.py" \
     --papers "${OUT_DIR}/stage3_links/papers_with_data_text.csv" \

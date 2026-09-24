@@ -94,6 +94,37 @@ between requests to that host, i.e. more conservative) -- this protects
 the serial (`--workers 1`) case too, so it is the right fix even if you
 also lower `--workers` as a stopgap.
 
+## stage4's MGnify-from-BioProject pass is optional (`--skip-mgnify`)
+
+Purpose: a paper whose only public data is raw sequencing reads
+(a BioProject accession, no processed table anywhere) normally lands in
+`raw_reads` -- you'd have to run your own 16S/metagenomics pipeline to
+get an abundance matrix. But EBI's MGnify runs a standard pipeline over
+public BioProjects automatically; if a match exists, this pass picks up
+that already-computed taxonomy table for free, letting stage5 credit the
+paper as `abundance_ready` (or `needs_content_check`) instead.
+
+**Not required for correctness.** Skipped BioProjects simply keep their
+`raw_reads`/needs-own-pipeline classification, which is already a valid
+outcome -- you just don't get the "free" matrices this pass can recover.
+
+**It's also the slowest part of stage4 by a wide margin**, even after
+fixing the three concrete bottlenecks found in it (a global-lock bug in
+`_netutil.Throttle` that degraded `--workers N` toward `N=1` at the rate
+gate, a 90s timeout letting one stalled request tie up a worker slot,
+and an uncapped per-BioProject fan-out -- one BioProject with 25 linked
+MGnify studies took 20s alone). Post-fix, measured throughput on a small
+real-API sample was ~5.5s/BioProject with `--workers 8`; at ~24k
+BioProjects that's still on the order of 35-40 hours, several SLURM
+`--time` windows even with clean resume support.
+
+Pass `--skip-mgnify` to stage4 to skip this pass entirely and get the
+main pipeline result (everything else in `datasets_master.csv`) without
+waiting on it. Run it separately afterward, on its own time budget, by
+resubmitting stage4 WITHOUT `--skip-mgnify` against the same `--outdir`
+-- it resumes cleanly (via `mgnify_checked_bioprojects.txt`) and doesn't
+redo anything else stage4 already resolved.
+
 ## Manual allowlist workflow
 
 Use `Database/results/stage1_papers/manual_whitelist.tsv` for papers that are valid but missed by the automated query logic. Each run of `stage1_search_papers.py` loads this file and unions its records into `papers_master.csv` before writing the final CSV. To add a new paper later, append a new TSV row with the same columns as the master CSV and rerun the stage.
