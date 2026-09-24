@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+csv.field_size_limit(sys.maxsize)  # listed_files can exceed the 131072-byte default
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
