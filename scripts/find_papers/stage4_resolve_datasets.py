@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -271,24 +272,49 @@ def main() -> None:
     # a processed taxonomy-abundance table on MGnify, avoiding a pipeline
     # re-run. This never overwrites the original bioproject row -- it adds a
     # sibling dataset record so stage5 can credit either source.
+    #
+    # Resuming this pass by dataset_id alone does NOT work: a checked
+    # bioproject with ZERO MGnify matches writes no output row at all, so
+    # there is nothing in datasets_master.csv to prove it was ever checked
+    # -- a naive resume would re-query every bioproject from scratch even
+    # if 24,000 of them were already checked and simply came back empty.
+    # Track "checked" explicitly in its own ledger, independent of whether
+    # a match was found.
+    mgnify_checked_path = Path(args.outdir) / "mgnify_checked_bioprojects.txt"
+    already_checked_bp = set()
+    if mgnify_checked_path.exists():
+        already_checked_bp = {l.strip() for l in mgnify_checked_path.open(encoding="utf-8") if l.strip()}
+        if already_checked_bp:
+            print(f"resuming mgnify pass: {len(already_checked_bp)} bioprojects already checked", flush=True)
+    mgnify_fh = mgnify_checked_path.open("a", encoding="utf-8")
+    mgnify_lock = threading.Lock()
+
+    def mark_checked(bp: str) -> None:
+        with mgnify_lock:
+            mgnify_fh.write(bp + "\n"); mgnify_fh.flush()
+
     seen_bioprojects = sorted(bp_rows)
-    pending_bp = [bp for bp in seen_bioprojects
-                 if f"mgnify_from_bioproject:{bp}" not in done_ids]  # coarse: re-checked below per-mgys anyway
+    pending_bp = [bp for bp in seen_bioprojects if bp not in already_checked_bp]
+    print(f"{len(seen_bioprojects)} bioprojects total, {len(pending_bp)} pending after resume", flush=True)
     if args.workers <= 1:
         for i, bp in enumerate(pending_bp, 1):
             for row in mgnify_lookup_one(bp, bp_rows[bp]):
                 if row["dataset_id"] not in done_ids:
                     emit(row)
+            mark_checked(bp)
             time.sleep(args.sleep)
             if i % 50 == 0: print(f"mgnify-checked {i}/{len(pending_bp)} bioprojects", flush=True)
     else:
         with ThreadPoolExecutor(args.workers) as ex:
             futs = {ex.submit(mgnify_lookup_one, bp, bp_rows[bp]): bp for bp in pending_bp}
             for i, fu in enumerate(as_completed(futs), 1):
+                bp = futs[fu]
                 for row in fu.result():
                     if row["dataset_id"] not in done_ids:
                         emit(row)
+                mark_checked(bp)
                 if i % 50 == 0: print(f"mgnify-checked {i}/{len(pending_bp)} bioprojects", flush=True)
+    mgnify_fh.close()
 
     fh.close()
     with out.open(newline="", encoding="utf-8") as f2:
