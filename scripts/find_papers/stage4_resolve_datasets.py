@@ -183,6 +183,11 @@ def mgnify_lookup_one(bp: str, src_row: dict) -> list[dict]:
     return out
 
 
+FIELDS = ["dataset_id", "repository", "accession", "paper_ids", "pmids", "dois", "landing_url",
+         "metadata_api_url", "n_listed_files", "listed_files", "library_strategy", "library_source",
+         "library_layout", "instrument_platform", "resolve_status", "resolve_error", "data_downloaded"]
+
+
 def main() -> None:
     base = Path(__file__).resolve().parent / "results"
     ap = argparse.ArgumentParser()
@@ -194,6 +199,25 @@ def main() -> None:
                     help="parallel accessions resolved at once. Safe to raise (8-16 is reasonable) "
                          "-- see _netutil.Throttle for why this doesn't hit any one API harder.")
     args = ap.parse_args()
+
+    out = Path(args.outdir) / "datasets_master.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resumable like stage6: every resolved dataset_id is appended to disk
+    # immediately, not accumulated in memory until the end. A job that hits
+    # its walltime limit partway through can just be resubmitted with the
+    # same --outdir -- already-resolved dataset_ids are skipped, not redone.
+    done_ids = set()
+    if out.exists():
+        with out.open(newline="", encoding="utf-8") as fh:
+            done_ids = {r["dataset_id"] for r in csv.DictReader(fh)}
+        if done_ids:
+            print(f"resuming: {len(done_ids)} dataset records already resolved in {out}", flush=True)
+    fh = out.open("a", newline="", encoding="utf-8")
+    w = csv.DictWriter(fh, fieldnames=FIELDS)
+    if out.stat().st_size == 0:
+        w.writeheader()
+
     grouped = {}
     bioproject_cache = {}
     for r in csv.DictReader(open(args.links, newline="", encoding="utf-8")):
@@ -210,44 +234,64 @@ def main() -> None:
         if normalization_error: x["normalization_error"] = normalization_error
         for s, dst in (("paper_id", "paper_ids"), ("pmid", "pmids"), ("doi", "dois")):
             if r.get(s): x[dst].add(r[s])
+    pending = {key: x for key, x in grouped.items()
+              if f"{key[0]}:{x['accession'] or key[1]}" not in done_ids}
+    print(f"{len(grouped)} grouped datasets, {len(pending)} pending after resume", flush=True)
 
-    rows = []
+    bp_rows: dict[str, dict] = {}  # accession -> row, for the mgnify pass below
+    def emit(row: dict) -> None:
+        w.writerow({k: row.get(k, "") for k in FIELDS}); fh.flush()
+        if row["repository"] == "bioproject" and row["accession"]:
+            bp_rows[row["accession"]] = row
+
     if args.workers <= 1:
-        for i, ((repo, key), x) in enumerate(grouped.items(), 1):
-            rows.append(resolve_one(repo, key, x))
-            if rows[-1]["metadata_api_url"]: time.sleep(args.sleep)
-            if i % 100 == 0: print(f"resolved {i}/{len(grouped)}", flush=True)
+        for i, ((repo, key), x) in enumerate(pending.items(), 1):
+            emit(resolve_one(repo, key, x))
+            if x.get("normalization_api"): time.sleep(args.sleep)
+            if i % 100 == 0: print(f"resolved {i}/{len(pending)}", flush=True)
     else:
         with ThreadPoolExecutor(args.workers) as ex:
-            futs = {ex.submit(resolve_one, repo, key, x): 1 for (repo, key), x in grouped.items()}
+            futs = {ex.submit(resolve_one, repo, key, x): 1 for (repo, key), x in pending.items()}
             for i, fu in enumerate(as_completed(futs), 1):
-                rows.append(fu.result())
-                if i % 100 == 0: print(f"resolved {i}/{len(grouped)}", flush=True)
+                emit(fu.result())
+                if i % 100 == 0: print(f"resolved {i}/{len(pending)}", flush=True)
+
+    # For the MGnify pass, bp_rows only has bioprojects resolved THIS run --
+    # on a resumed run we also need bioprojects that were already resolved
+    # in a prior (interrupted) run, so re-read them from disk.
+    if done_ids:
+        with out.open(newline="", encoding="utf-8") as f2:
+            for r in csv.DictReader(f2):
+                if r["repository"] == "bioproject" and r["accession"]:
+                    bp_rows.setdefault(r["accession"], r)
 
     # MGnify shortcut: a BioProject that only has raw reads may already have
     # a processed taxonomy-abundance table on MGnify, avoiding a pipeline
     # re-run. This never overwrites the original bioproject row -- it adds a
     # sibling dataset record so stage5 can credit either source.
-    seen_bioprojects = sorted({r["accession"] for r in rows if r["repository"] == "bioproject" and r["accession"]})
-    by_bp = {r["accession"]: r for r in rows if r["repository"] == "bioproject"}
+    seen_bioprojects = sorted(bp_rows)
+    pending_bp = [bp for bp in seen_bioprojects
+                 if f"mgnify_from_bioproject:{bp}" not in done_ids]  # coarse: re-checked below per-mgys anyway
     if args.workers <= 1:
-        for i, bp in enumerate(seen_bioprojects, 1):
-            rows.extend(mgnify_lookup_one(bp, by_bp[bp]))
+        for i, bp in enumerate(pending_bp, 1):
+            for row in mgnify_lookup_one(bp, bp_rows[bp]):
+                if row["dataset_id"] not in done_ids:
+                    emit(row)
             time.sleep(args.sleep)
-            if i % 50 == 0: print(f"mgnify-checked {i}/{len(seen_bioprojects)} bioprojects", flush=True)
+            if i % 50 == 0: print(f"mgnify-checked {i}/{len(pending_bp)} bioprojects", flush=True)
     else:
         with ThreadPoolExecutor(args.workers) as ex:
-            futs = {ex.submit(mgnify_lookup_one, bp, by_bp[bp]): bp for bp in seen_bioprojects}
+            futs = {ex.submit(mgnify_lookup_one, bp, bp_rows[bp]): bp for bp in pending_bp}
             for i, fu in enumerate(as_completed(futs), 1):
-                rows.extend(fu.result())
-                if i % 50 == 0: print(f"mgnify-checked {i}/{len(seen_bioprojects)} bioprojects", flush=True)
+                for row in fu.result():
+                    if row["dataset_id"] not in done_ids:
+                        emit(row)
+                if i % 50 == 0: print(f"mgnify-checked {i}/{len(pending_bp)} bioprojects", flush=True)
 
-    out = Path(args.outdir) / "datasets_master.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fields = list(rows[0]) if rows else ["dataset_id", "repository", "accession", "paper_ids", "pmids", "dois", "landing_url", "metadata_api_url", "n_listed_files", "listed_files", "library_strategy", "library_source", "library_layout", "instrument_platform", "resolve_status", "resolve_error", "data_downloaded"]
-    with out.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields); w.writeheader(); w.writerows(rows)
-    print(f"wrote {len(rows)} dataset records -> {out}")
+    fh.close()
+    with out.open(newline="", encoding="utf-8") as f2:
+        n_total = sum(1 for _ in csv.DictReader(f2))
+    print(f"done. {n_total} dataset records total -> {out}")
 
 
 if __name__ == "__main__":
