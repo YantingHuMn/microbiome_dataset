@@ -347,8 +347,25 @@ def cmd_extract(args: argparse.Namespace) -> None:
                    "n_samples": 0, "n_taxa": 0, "matrix_path": "",
                    "blocked_files": [], "error": "no abundance_ready dataset resolved for this paper"}
         else:
-            rec = process_paper(p, ds, scratch, args.max_file_mb, args.max_study_mb,
-                                data_dir, taken_study_ids, study_id_lock)
+            # process_paper can, in principle, hit an exception its own
+            # internal try/excepts don't cover (a pandas bug, a disk-full
+            # write, an unanticipated data shape, ...). Without this catch,
+            # that exception propagates through the worker thread's Future
+            # and re-raises in the main thread at fu.result() below --
+            # crashing the ENTIRE extract run (and, in submit_all_steps.sh,
+            # likely preventing the downstream build phase from running at
+            # all this submission) over ONE paper, while that paper's
+            # record never reaches progress.jsonl either. Catch it here so
+            # one paper's crash becomes a normal, traceable "error" record
+            # -- exactly like every other failure mode fixed today -- and
+            # every other paper still gets processed and recorded.
+            try:
+                rec = process_paper(p, ds, scratch, args.max_file_mb, args.max_study_mb,
+                                    data_dir, taken_study_ids, study_id_lock)
+            except Exception as e:                   # noqa: BLE001
+                rec = {"paper_id": p["paper_id"], "status": "blocked", "study_id": "",
+                       "n_samples": 0, "n_taxa": 0, "matrix_path": "", "blocked_files": [],
+                       "error": f"process_paper_crashed:{type(e).__name__}:{e}"}
         with write_lock:
             out_fh.write(json.dumps(rec) + "\n")
             out_fh.flush()
