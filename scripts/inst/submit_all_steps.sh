@@ -23,8 +23,25 @@ export PYTHONUNBUFFERED=1
 # module purge
 # module add r/4.4.0
 # module load seurat/5.3.0-R4.4.0
-module load anaconda
-conda activate virus
+#
+# Environment activation is cluster-specific -- module systems and conda
+# install paths differ between longleaf and sycamore. Detect by hostname
+# rather than hardcoding one cluster's setup, so the SAME script works
+# unmodified on either (a wrong/missing conda env here means every python3
+# call below silently runs in whatever env happened to be active instead --
+# e.g. check_dependencies() correctly caught this as a missing xlrd, but a
+# less-guarded dependency could fail silently instead).
+case "$(hostname)" in
+    *sycamore*)
+        source /nas/sycamore/apps/anaconda/2025.12-2/etc/profile.d/conda.sh
+        conda activate virus_syca
+        ;;
+    *)
+        module load anaconda
+        conda activate virus
+        ;;
+esac
+echo "conda env: ${CONDA_DEFAULT_ENV:-unknown} ($(command -v python3))"
 
 cd /hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset
 READ_DIR="/hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/scripts/find_papers"
