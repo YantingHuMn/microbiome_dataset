@@ -303,6 +303,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
     scratch = Path(args.scratch); scratch.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir)
+    Path(args.progress).parent.mkdir(parents=True, exist_ok=True)
     out_fh = open(args.progress, "a", encoding="utf-8")
     write_lock = threading.Lock()
     study_id_lock = threading.Lock()
