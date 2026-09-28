@@ -13,6 +13,13 @@
 # #SBATCH --array=0-3
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+# Force unbuffered stdout/stderr for every python invocation below. Without
+# this, output redirected to a file (not a TTY) is block-buffered by
+# default -- a script that's genuinely running can leave .out/.err looking
+# completely empty for a long time even though it already printed its
+# startup lines, because they're sitting in an unflushed buffer rather
+# than on disk. This removes that ambiguity for good.
+export PYTHONUNBUFFERED=1
 # module purge
 # module add r/4.4.0
 # module load seurat/5.3.0-R4.4.0
