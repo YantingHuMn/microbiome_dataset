@@ -25,23 +25,27 @@ export PYTHONUNBUFFERED=1
 # module load seurat/5.3.0-R4.4.0
 #
 # Environment activation is cluster-specific -- module systems and conda
-# install paths differ between longleaf and sycamore. Detect by hostname
-# rather than hardcoding one cluster's setup, so the SAME script works
-# unmodified on either (a wrong/missing conda env here means every python3
-# call below silently runs in whatever env happened to be active instead --
-# e.g. check_dependencies() correctly caught this as a missing xlrd, but a
-# less-guarded dependency could fail silently instead).
-case "$(hostname)" in
-    *sycamore*)
-        source /nas/sycamore/apps/anaconda/2025.12-2/etc/profile.d/conda.sh
-        conda activate virus_syca
-        ;;
-    *)
-        module load anaconda
-        conda activate virus
-        ;;
-esac
-echo "conda env: ${CONDA_DEFAULT_ENV:-unknown} ($(command -v python3))"
+# install paths differ between longleaf and sycamore. Detect by checking
+# whether the sycamore conda install PATH exists, not by hostname --
+# compute-node hostnames are usually generic (e.g. longleaf's own compute
+# nodes are named "c151613", nothing like "longleaf"), so a job actually
+# running on a sycamore compute node would NOT match "*sycamore*" even
+# though the login node does. The shared /nas/sycamore filesystem, by
+# contrast, is mounted identically on every node of that cluster
+# (that's the whole point of a shared filesystem), so its existence is a
+# reliable signal regardless of what the current node happens to be
+# called. (A wrong/missing conda env here means every python3 call below
+# silently runs in whatever env happened to be active instead -- e.g.
+# check_dependencies() correctly caught this as a missing xlrd, but a
+# less-guarded dependency could fail silently instead.)
+if [ -d /nas/sycamore/home/yanting/.conda/envs/virus_syca ]; then
+    source /nas/sycamore/apps/anaconda/2025.12-2/etc/profile.d/conda.sh
+    conda activate virus_syca
+else
+    module load anaconda
+    conda activate virus
+fi
+echo "conda env: ${CONDA_DEFAULT_ENV:-unknown} ($(command -v python3)) on $(hostname)"
 
 cd /hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset
 READ_DIR="/hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/scripts/find_papers"
