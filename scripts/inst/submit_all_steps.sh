@@ -23,11 +23,6 @@ cd /hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset
 READ_DIR="/hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/scripts/find_papers"
 OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 
-# All stages below accept --workers N for concurrent, per-host rate-limited
-# requests (see scripts/find_papers/_netutil.py). Turn this down (or to 1,
-# the old sequential behavior) if any one API starts throttling/erroring --
-# raising it further past ~8-16 mostly stops helping since most APIs' own
-# per-host pacing becomes the bottleneck before your CPU/network does.
 WORKERS=8
 
 # python ${READ_DIR}/stage0_build_queries.py \
@@ -46,21 +41,32 @@ WORKERS=8
 #     --outdir "${OUT_DIR}/stage3_links" \
 #     --workers "${WORKERS}"
 
-# --skip-mgnify skips the optional MGnify-from-BioProject reverse lookup
-# (best-effort shortcut, not required for correctness -- see
-# scripts/find_papers/README.md). Even after the speed fixes it's still
-# ~35-40h for ~24k BioProjects; comment out --skip-mgnify to run it once
-# the main pipeline result is in hand, on its own time budget.
-python "${READ_DIR}/stage4_resolve_datasets.py" \
-    --links "${OUT_DIR}/stage3_links/paper_data_links.csv" \
-    --outdir "${OUT_DIR}/stage4_datasets" \
-    --workers "${WORKERS}" \
-    --skip-mgnify
+# python "${READ_DIR}/stage4_resolve_datasets.py" \
+#     --links "${OUT_DIR}/stage3_links/paper_data_links.csv" \
+#     --outdir "${OUT_DIR}/stage4_datasets" \
+#     --workers "${WORKERS}" \
+#     --skip-mgnify
 
-python "${READ_DIR}/stage5_classify_candidates.py" \
-    --papers "${OUT_DIR}/stage3_links/papers_with_data_text.csv" \
-    --datasets "${OUT_DIR}/stage4_datasets/datasets_master.csv" \
-    --outdir "${OUT_DIR}/stage5_final"
+
+# python "${READ_DIR}/stage5_classify_candidates.py" \
+#     --papers "${OUT_DIR}/stage3_links/papers_with_data_text.csv" \
+#     --datasets "${OUT_DIR}/stage4_datasets/datasets_master.csv" \
+#     --outdir "${OUT_DIR}/stage5_final"
+
+# python scripts/find_papers/augment_europepmc_supp.py fetch \
+#     --master /hickory/proj/didonglab/dataset/virus/Database/results/stage4_datasets/datasets_master.csv \
+#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage4_datasets/augment_progress.jsonl \
+#     --workers 8
+
+# python scripts/find_papers/augment_europepmc_supp.py merge \
+#     --master /hickory/proj/didonglab/dataset/virus/Database/results/stage4_datasets/datasets_master.csv \
+#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage4_datasets/augment_progress.jsonl
+
+# python scripts/find_papers/stage5_classify_candidates.py \
+#     --datasets "${OUT_DIR}/stage4_datasets/datasets_master.csv" \
+#     --papers "${OUT_DIR}/stage3_links/papers_with_data_text.csv" \
+#     --outdir "${OUT_DIR}/stage5_final"
+
 
 # # stage6 downloads real files -- --workers here also multiplies peak
 # # disk/memory (roughly WORKERS x --max-study-mb under --scratch), unlike
@@ -73,3 +79,20 @@ python "${READ_DIR}/stage5_classify_candidates.py" \
 #     --scratch "${OUT_DIR}/stage6_scratch" \
 #     --max-study-mb 500 \
 #     --workers "${WORKERS}"
+
+# download + analysize (can pause)
+python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
+    --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+    --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
+    --data-dir /hickory/proj/didonglab/dataset/virus/Database/data \
+    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
+    --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
+    --workers 8
+
+# combine
+python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py build \
+    --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
+    --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies.tsv \
+    --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample.tsv \
+    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download.tsv

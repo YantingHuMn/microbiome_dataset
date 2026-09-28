@@ -33,33 +33,8 @@ authorString "Ramirez AL, ..." + pubYear 2026 -> "Ramirez_2026". Collisions
 recorded in the progress ledger so a resumed run keeps prior assignments
 stable rather than recomputing them from scratch.
 
-Two independently resumable phases, same pattern as
-augment_europepmc_supp.py:
-  extract  -- network phase. One JSON line per paper appended to
-              --progress as it resolves (safe to interrupt/rerun; already-
-              recorded paper_ids are skipped). Writes matrix files to
-              --data-dir as papers succeed.
-  build    -- local-only. Reads --progress + --abundance-ready and writes
-              studies.tsv / sample.tsv / blocked_manual_download.tsv.
-              Rerun freely; it is a pure, fast, idempotent merge.
-
-Usage
------
-    python3 stage7_extract_abundance_matrix.py extract \\
-        --abundance-ready Database/results/stage5_final/abundance_ready.csv \\
-        --datasets        Database/results/stage5_final/dataset_candidates_final.csv \\
-        --data-dir        Database/data \\
-        --progress        Database/results/stage7_extract/progress.jsonl \\
-        --scratch         /scratch/$USER/mb_stage7 \\
-        --workers 8
-
-    python3 stage7_extract_abundance_matrix.py build \\
-        --abundance-ready Database/results/stage5_final/abundance_ready.csv \\
-        --progress        Database/results/stage7_extract/progress.jsonl \\
-        --studies-tsv     Database/metadata/studies.tsv \\
-        --sample-tsv      Database/metadata/sample.tsv \\
-        --blocked-tsv     Database/metadata/blocked_manual_download.tsv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -102,10 +77,7 @@ SAMPLE_FIELDS = ["study_id", "submission_accession", "sample_id", "participant_i
 BLOCKED_FIELDS = ["paper_id", "pmid", "pmcid", "doi", "title", "dataset_id", "repository",
                    "accession", "landing_url", "attempted_files", "reason", "notes"]
 
-# --------------------------------------------------------------------------- #
 # 1. study_id = FirstAuthorSurname_Year, via a lightweight Europe PMC lookup
-# --------------------------------------------------------------------------- #
-
 def _ascii_surname(raw: str) -> str:
     """Strip accents/diacritics to plain ASCII letters (Ramirez, not Ram\u00edrez)."""
     norm = unicodedata.normalize("NFKD", raw)
@@ -164,13 +136,10 @@ def assign_study_id(surname: str, year: str, taken: set[str]) -> str:
     return f"{base}_{len(taken)}"
 
 
-# --------------------------------------------------------------------------- #
 # 2. anti-bot / challenge-page detection (stage6 doesn't distinguish this --
 #    a "download succeeded" that's actually an HTML challenge page just
 #    fails later at iter_tables with a confusing "can't determine engine"
 #    error; this makes the failure mode explicit for the blocked-list)
-# --------------------------------------------------------------------------- #
-
 CHALLENGE_SIGNATURES = (b"<html", b"<!DOCTYPE", b"cloudpmc", b"Preparing to download")
 BINARY_TABLE_EXT = {".xlsx", ".xls", ".biom", ".qza"}
 
@@ -185,11 +154,8 @@ def looks_like_challenge_page(path: Path) -> bool:
     return any(sig in head for sig in CHALLENGE_SIGNATURES)
 
 
-# --------------------------------------------------------------------------- #
 # 3. wide matrix: pivot to_long_rows' output into sample_id x taxon, with
 #    virus_/prok_-prefixed column names and a `source` column
-# --------------------------------------------------------------------------- #
-
 def build_wide_matrix(long_df):
     """long_df: concatenated to_long_rows() output across all of a study's
     datasets. Returns a wide pandas DataFrame: sample_id, source, then one
@@ -225,12 +191,9 @@ def build_wide_matrix(long_df):
     return piv[cols]
 
 
-# --------------------------------------------------------------------------- #
 # 4. extract phase: one paper at a time -- download every abundance_ready
 #    dataset it has, accumulate long rows, write the wide matrix, record
 #    the outcome (including which files were anti-bot-blocked, if any)
-# --------------------------------------------------------------------------- #
-
 def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                    max_file_mb: float, max_study_mb: float, data_dir: Path,
                    taken_study_ids: set[str], lock: threading.Lock) -> dict:
@@ -373,10 +336,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     print(f"done. {n_done[0]} papers processed this run.")
 
 
-# --------------------------------------------------------------------------- #
 # 5. build phase: local-only merge into studies.tsv / sample.tsv / blocked
-# --------------------------------------------------------------------------- #
-
 def append_tsv(path: Path, fieldnames: list[str], rows: list[dict], key_fields: tuple[str, ...]) -> int:
     """Append rows not already present (by key_fields) -- idempotent on rerun.
     Returns the number of rows actually written."""
