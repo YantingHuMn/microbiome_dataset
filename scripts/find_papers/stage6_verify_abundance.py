@@ -160,9 +160,19 @@ def detect_pipeline(*texts: str) -> str:
 # download -- one file at a time, streamed, size-capped, never re-read twice
 # --------------------------------------------------------------------------- #
 
-def stream_download(url: str, dest: Path, max_mb: float) -> tuple[bool, str]:
+def stream_download(url: str, dest: Path, max_mb: float, overall_timeout_s: float = 600) -> tuple[bool, str]:
+    """`timeout=300` on urlopen()/read() only bounds a SINGLE read call --
+    a server that trickles data slowly enough to keep resetting that
+    per-call timer (a chunk every <300s) can stall the WHOLE download
+    indefinitely without ever raising. If several workers each land on a
+    connection like that at once, the entire --workers batch can appear
+    frozen (progress.jsonl stops growing) with nothing timing out to
+    surface it. overall_timeout_s bounds the TOTAL wall-clock time spent
+    reading, independent of per-call timeouts, and is checked once per
+    chunk so a genuinely slow-but-alive connection still gets cut off."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    t0 = time.monotonic()
     try:
         GLOBAL_THROTTLE.wait(url)
         req = urllib.request.Request(url, headers=UA)
@@ -173,6 +183,10 @@ def stream_download(url: str, dest: Path, max_mb: float) -> tuple[bool, str]:
             written = 0
             with open(tmp, "wb") as fh:
                 while True:
+                    if time.monotonic() - t0 > overall_timeout_s:
+                        fh.close()
+                        tmp.unlink(missing_ok=True)
+                        return False, f"download_timeout_exceeded:{overall_timeout_s}s"
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
