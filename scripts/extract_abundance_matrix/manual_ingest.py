@@ -47,7 +47,7 @@ from stage6_verify_abundance import iter_tables, sniff_frame, to_long_rows  # no
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from stage7_extract_abundance_matrix import (         # noqa: E402
-    build_wide_matrix, fetch_first_author_year, assign_study_id,
+    build_wide_matrix, fetch_first_author_year, assign_study_id, MatrixTooLargeError,
 )
 
 
@@ -120,7 +120,11 @@ def main() -> None:
         if err:
             print(f"note: author lookup failed ({err}) -- study_id falls back to {study_id!r}")
 
-    wide = build_wide_matrix(long_df)
+    try:
+        wide = build_wide_matrix(long_df)
+    except MatrixTooLargeError as e:
+        print(f"refusing to build matrix -- {e}. progress.jsonl was NOT modified.")
+        return
     if old_wide is not None:
         wide = pd.concat([old_wide, wide], ignore_index=True).fillna(0)
         # a sample appearing in both (re-ingesting the same file twice) should

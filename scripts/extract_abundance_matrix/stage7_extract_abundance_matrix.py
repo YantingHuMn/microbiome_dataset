@@ -171,11 +171,30 @@ def looks_like_challenge_page(path: Path) -> bool:
 
 # 3. wide matrix: pivot to_long_rows' output into sample_id x taxon, with
 #    virus_/prok_-prefixed column names and a `source` column
-def build_wide_matrix(long_df):
+class MatrixTooLargeError(Exception):
+    """Raised by build_wide_matrix() instead of letting pivot_table()
+    attempt a combinatorially huge reshape. A paper whose datasets contain
+    many largely non-overlapping small tables (each with its own taxon
+    vocabulary) can drive n_unique_samples x n_unique_taxa into the tens
+    of millions -- pivot_table's internal groupby/unstack multiplies that
+    several times over during the reshape, and this is the real mechanism
+    behind stage7 OOMing at values as high as 128G that plain per-worker
+    file-size budgets (--max-file-mb/--max-study-mb) do not bound at all
+    (those cap DOWNLOADED bytes, not the CARDINALITY of the accumulated
+    long-format table)."""
+
+
+def build_wide_matrix(long_df, max_cells: int = 20_000_000):
     """long_df: concatenated to_long_rows() output across all of a study's
     datasets. Returns a wide pandas DataFrame: sample_id, source, then one
     column per taxon (most-specific non-empty rank name), prefixed by
-    domain (virus_/prok_)."""
+    domain (virus_/prok_). Raises MatrixTooLargeError BEFORE calling
+    pivot_table if n_unique_samples * n_unique_taxa would exceed
+    max_cells (default 20M cells ~ 160MB of raw float64 data -- generous
+    for any real abundance matrix, which is normally thousands of taxa x
+    hundreds of samples at most, while still catching the pathological
+    high-cardinality case above by orders of magnitude before it can
+    exhaust node memory)."""
     import pandas as pd
     if long_df.empty:
         return pd.DataFrame()
@@ -195,6 +214,16 @@ def build_wide_matrix(long_df):
     df["taxon_label"] = df.apply(taxon_label, axis=1)
     prefix = df["domain"].map({"virus": "virus_", "prokaryote": "prok_"}).fillna("prok_")
     df["col_name"] = prefix + df["taxon_label"].astype(str).str.replace(r"[^\w]+", "_", regex=True)
+
+    n_samples = df["sample_id"].nunique()
+    n_cols = df["col_name"].nunique()
+    est_cells = n_samples * n_cols
+    if est_cells > max_cells:
+        raise MatrixTooLargeError(
+            f"{n_samples} unique samples x {n_cols} unique taxa = {est_cells:,} estimated cells "
+            f"(cap {max_cells:,}) -- refusing to pivot; likely many small, largely non-overlapping "
+            f"tables concatenated across this paper's datasets")
+
     # a (sample, taxon) pair can appear more than once across multiple
     # files/datasets for the same study -- sum rather than silently drop.
     piv = df.pivot_table(index="sample_id", columns="col_name", values="value", aggfunc="sum", fill_value=0)
@@ -275,7 +304,12 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
 
     import pandas as pd
     long_df = pd.concat(all_long, ignore_index=True)
-    wide = build_wide_matrix(long_df)
+    try:
+        wide = build_wide_matrix(long_df)
+    except MatrixTooLargeError as e:
+        return {"paper_id": paper_id, "status": "blocked", "study_id": "",
+                "n_samples": 0, "n_taxa": 0, "matrix_path": "",
+                "blocked_files": blocked_files, "error": f"matrix_too_large:{e}"}
     if wide.empty:
         return {"paper_id": paper_id, "status": "blocked", "study_id": "",
                 "n_samples": 0, "n_taxa": 0, "matrix_path": "",
