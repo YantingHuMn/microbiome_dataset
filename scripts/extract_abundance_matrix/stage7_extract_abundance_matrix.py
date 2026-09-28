@@ -469,12 +469,14 @@ def cmd_build(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     studies_rows, sample_rows, blocked_rows = [], [], []
+    status_by_paper: dict[str, str] = {}
     with open(args.progress, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
+            status_by_paper[rec["paper_id"]] = rec["status"]
             paper = papers_by_id.get(rec["paper_id"])
             if paper is None:
                 continue
@@ -542,11 +544,23 @@ def cmd_build(args: argparse.Namespace) -> None:
                     key_fields=("paper_id", "dataset_id", "attempted_files"))
     print(f"wrote {n1} new study rows, {n2} new sample rows, {n3} new blocked entries "
           f"(rows already present from an earlier build run were skipped)")
-    n_blocked_papers = len({r["paper_id"] for r in blocked_rows})
-    print(f"\n{len(studies_rows)} studies got a matrix written to disk. "
-          f"{n_blocked_papers} abundance_ready papers had every file blocked -- "
-          f"see {args.blocked_tsv} for which ones and why (most commonly "
-          f"anti_bot_challenge_page = manual browser download needed).")
+    # blocked_rows mixes two DIFFERENT situations that must not be reported
+    # as one number: a paper with status=="blocked" never produced a matrix
+    # at all, while a paper with status=="ok" but non-empty blocked_files
+    # DID get a matrix -- just possibly missing whatever those specific
+    # blocked files would have contributed. Conflating them as "had every
+    # file blocked" is simply false for the second group.
+    fully_blocked_papers = {r["paper_id"] for r in blocked_rows
+                            if status_by_paper.get(r["paper_id"]) == "blocked"}
+    partial_papers = {r["paper_id"] for r in blocked_rows} - fully_blocked_papers
+    print(f"\n{len(studies_rows)} studies got a matrix written to disk.")
+    print(f"{len(fully_blocked_papers)} abundance_ready papers had EVERY file blocked "
+          f"(no matrix produced at all) -- see {args.blocked_tsv} for which ones and why "
+          f"(most commonly anti_bot_challenge_page = manual browser download needed).")
+    if partial_papers:
+        print(f"{len(partial_papers)} more papers DID get a matrix, but had one or more "
+              f"individual files blocked (possible missing data, not a total failure) -- "
+              f"same {args.blocked_tsv}, look up these paper_ids to see which files/reasons.")
 
 
 def main() -> None:
