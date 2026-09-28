@@ -38,8 +38,10 @@ stable rather than recomputing them from scratch.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import gc
+import io
 import json
 import re
 import shutil
@@ -236,16 +238,31 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                 blocked_files.append((dsid, name, "anti_bot_challenge_page"))
                 local.unlink(missing_ok=True)
                 continue
+            # iter_tables (stage6, shared code) SWALLOWS its own exceptions
+            # internally -- on a bad nested member (corrupt/mislabeled zip
+            # member, non-gzip ".gz", etc.) it just prints to stderr and the
+            # generator quietly yields fewer/no items, with nothing raised
+            # to this caller. Capture that stderr so ANY such internal
+            # failure -- not just the anti-bot case looks_like_challenge_page
+            # already catches -- gets a real, traceable reason in
+            # blocked_files instead of silently vanishing.
+            stderr_buf = io.StringIO()
             try:
-                for _sub_id, _hr, d in iter_tables(local):
-                    v = sniff_frame(d)
-                    if not v["is_abundance"]:
-                        continue
-                    rows = to_long_rows(d, v, paper_id, dsid, name)
-                    if not rows.empty:
-                        all_long.append(rows)
+                with contextlib.redirect_stderr(stderr_buf):
+                    for _sub_id, _hr, d in iter_tables(local):
+                        v = sniff_frame(d)
+                        if not v["is_abundance"]:
+                            continue
+                        rows = to_long_rows(d, v, paper_id, dsid, name)
+                        if not rows.empty:
+                            all_long.append(rows)
             except Exception as e:                   # noqa: BLE001
                 blocked_files.append((dsid, name, f"parse_error:{type(e).__name__}"))
+            captured = stderr_buf.getvalue().strip()
+            if captured:
+                for eline in captured.splitlines():
+                    if eline.strip():
+                        blocked_files.append((dsid, name, f"iter_tables_internal_error:{eline.strip()}"))
             local.unlink(missing_ok=True)
         gc.collect()
 
