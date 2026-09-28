@@ -141,12 +141,25 @@ def assign_study_id(surname: str, year: str, taken: set[str]) -> str:
 #    fails later at iter_tables with a confusing "can't determine engine"
 #    error; this makes the failure mode explicit for the blocked-list)
 CHALLENGE_SIGNATURES = (b"<html", b"<!DOCTYPE", b"cloudpmc", b"Preparing to download")
-BINARY_TABLE_EXT = {".xlsx", ".xls", ".biom", ".qza"}
 
 
 def looks_like_challenge_page(path: Path) -> bool:
-    if path.suffix.lower() not in BINARY_TABLE_EXT:
-        return False  # csv/tsv/txt are plausibly real even if small/textual
+    """Checked on EVERY downloaded file regardless of extension -- a bug
+    fix from an earlier version that only checked a fixed set of "binary"
+    extensions (.xlsx/.xls/.biom/.qza) and missed .zip entirely, letting
+    real cases (mmc1.zip, mmc2.zip, FSN3-11-3154-s001.zip -- Elsevier/
+    Wiley supplementary bundles scraped from a PMC page's Associated Data
+    links, same anti-bot wall as commit 736a9e6) fall through: the
+    "download" succeeds (HTTP 200, a small HTML challenge page) but
+    zipfile.ZipFile() then raises "File is not a zip file" -- and because
+    that happens inside stage6's iter_tables(), which SWALLOWS its own
+    exceptions (prints to stderr, yields nothing), the caller never even
+    sees an error: the file just silently looks like "no abundance data
+    found here" instead of "blocked". The signature check itself is
+    specific enough (exact HTML/challenge-page markers) that running it
+    unconditionally is safe -- no genuine CSV/TSV/XLSX content would ever
+    contain these bytes in its first 512 bytes.
+    """
     try:
         head = path.read_bytes()[:512]
     except Exception:                                # noqa: BLE001
