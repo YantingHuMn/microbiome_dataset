@@ -246,8 +246,21 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
     all_long = []
     blocked_files = []   # [(dataset_id, filename, reason)]
     budget_used = 0.0
+    total_rows_accumulated = 0
+    # max_study_mb only bounds DOWNLOADED BYTES -- a paper anomalously
+    # linked to a huge number of small files/datasets (a stage5
+    # data-quality issue, not something this function can fix at the
+    # source) can still accumulate an unbounded number of small,
+    # string-heavy long-format rows in `all_long` before pd.concat() is
+    # ever called, which is BEFORE MatrixTooLargeError's cardinality
+    # check even runs -- concat itself can already exhaust memory. Cap
+    # total accumulated rows directly, independent of MB budget.
+    MAX_ACCUMULATED_ROWS = 2_000_000
+    row_cap_hit = False
 
     for ds in datasets:
+        if row_cap_hit:
+            break
         repo, acc, dsid = ds["repository"], ds["accession"], ds["dataset_id"]
         try:
             files = list_deposit_files(repo, acc)
@@ -255,6 +268,8 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
             blocked_files.append((dsid, "<listing>", f"list_deposit_files error: {e}"))
             continue
         for name, url, _size in files:
+            if row_cap_hit:
+                break
             if budget_used > max_study_mb * 1e6 or not url:
                 continue
             local = study_dir / re.sub(r"[^A-Za-z0-9._-]", "_", name)[:100]
@@ -285,6 +300,12 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                         rows = to_long_rows(d, v, paper_id, dsid, name)
                         if not rows.empty:
                             all_long.append(rows)
+                            total_rows_accumulated += len(rows)
+                            if total_rows_accumulated > MAX_ACCUMULATED_ROWS:
+                                blocked_files.append((dsid, name,
+                                    f"accumulation_capped:{total_rows_accumulated}_rows_exceeds_{MAX_ACCUMULATED_ROWS}"))
+                                row_cap_hit = True
+                                break
             except Exception as e:                   # noqa: BLE001
                 blocked_files.append((dsid, name, f"parse_error:{type(e).__name__}"))
             captured = stderr_buf.getvalue().strip()
