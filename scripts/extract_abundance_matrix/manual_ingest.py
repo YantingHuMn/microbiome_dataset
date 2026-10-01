@@ -43,11 +43,13 @@ from pathlib import Path
 csv.field_size_limit(sys.maxsize)
 
 sys.path.insert(0, str((Path(__file__).resolve().parent.parent / "find_papers")))
-from stage6_verify_abundance import iter_tables, sniff_frame, to_long_rows  # noqa: E402
+from stage6_verify_abundance import (          # noqa: E402
+    iter_tables, sniff_frame, to_long_rows, retain_raw_file, append_raw_manifest,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from stage7_extract_abundance_matrix import (         # noqa: E402
-    build_wide_matrix, fetch_first_author_year, assign_study_id, MatrixTooLargeError,
+    build_table_matrix, fetch_first_author_year, assign_study_id, MatrixTooLargeError,
 )
 
 
@@ -57,6 +59,9 @@ def main() -> None:
     ap.add_argument("--datasets", required=True)
     ap.add_argument("--progress", required=True)
     ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--raw-store", required=True,
+                    help="the file you downloaded by hand is COPIED here (byte-for-byte, SHA256 "
+                         "recorded) -- same permanent audit trail as an automated download.")
     ap.add_argument("--paper-id", required=True)
     ap.add_argument("--dataset-id", required=True, help="e.g. europepmc_supp:PMC12927239 "
                     "(must already exist as a row in --datasets, for provenance)")
@@ -75,43 +80,26 @@ def main() -> None:
         print(f"FATAL: {local} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    print(f"opening {local} ...")
-    all_long = []
-    n_checked = 0
-    for _sub_id, _hr, d in iter_tables(local):
-        n_checked += 1
-        v = sniff_frame(d)
-        if not v["is_abundance"]:
-            continue
-        rows = to_long_rows(d, v, args.paper_id, args.dataset_id, local.name)
-        if not rows.empty:
-            all_long.append(rows)
+    repo = args.dataset_id.split(":", 1)[0] if ":" in args.dataset_id else ""
+    acc = args.dataset_id.split(":", 1)[1] if ":" in args.dataset_id else ""
+    manifest_row = retain_raw_file(local, Path(args.raw_store), args.paper_id, args.dataset_id,
+                                   repo, acc, source_url="manually_downloaded_by_user",
+                                   original_filename=local.name)
+    append_raw_manifest(Path(args.raw_store) / "raw_files_manifest.csv", manifest_row)
+    local = Path(manifest_row["retained_path"])
+    print(f"retained a permanent copy at {local} (sha256={manifest_row['sha256'][:12]}...)")
 
-    if not all_long:
-        print(f"no abundance-shaped table found in {local.name} ({n_checked} sheet(s)/table(s) checked). "
-              "progress.jsonl was NOT modified -- this file doesn't get counted as a success.")
-        return
-
+    print(f"opening {local} (full read, not the row-capped preview) ...")
     import pandas as pd
-    long_df = pd.concat(all_long, ignore_index=True)
-
-    # if this paper already has a partial "ok" record (some datasets already
-    # succeeded automatically, this one didn't), merge with its prior long
-    # rows so the manual file ADDS to, rather than replaces, existing data.
     existing_records = []
     if Path(args.progress).exists():
         with open(args.progress, encoding="utf-8") as f:
             existing_records = [json.loads(l) for l in f if l.strip()]
-    prior = next((r for r in existing_records if r["paper_id"] == args.paper_id and r["status"] == "ok"), None)
-    if prior and prior.get("matrix_path") and Path(prior["matrix_path"]).exists():
-        old_wide = pd.read_csv(prior["matrix_path"], sep="\t")
-        prior_path = prior["matrix_path"]
-        print(f"paper already has a matrix from an earlier run ({prior_path}) "
-              "-- merging this file's data into it rather than starting over.")
+    prior = next((r for r in existing_records if r["paper_id"] == args.paper_id), None)
+    taken = {r.get("study_id") for r in existing_records if r.get("study_id")}
+    if prior and prior.get("study_id"):
         study_id = prior["study_id"]
     else:
-        old_wide = None
-        taken = {r.get("study_id") for r in existing_records if r.get("study_id")}
         surname, year, err = fetch_first_author_year(paper.get("pmid", ""), paper.get("doi", ""))
         if surname and year:
             study_id = assign_study_id(surname, year, taken)
@@ -120,26 +108,68 @@ def main() -> None:
         if err:
             print(f"note: author lookup failed ({err}) -- study_id falls back to {study_id!r}")
 
-    try:
-        wide = build_wide_matrix(long_df)
-    except MatrixTooLargeError as e:
-        print(f"refusing to build matrix -- {e}. progress.jsonl was NOT modified.")
+    data_dir = Path(args.data_dir) / study_id
+    data_dir.mkdir(parents=True, exist_ok=True)
+    n_checked = 0
+    new_tables = []
+    for sub_id, _hr, d in iter_tables(local, preview=False):
+        n_checked += 1
+        v = sniff_frame(d)
+        if not v["is_abundance"]:
+            continue
+        source_file = f"{local.name}!{sub_id}"
+        if v["needs_review"]:
+            print(f"  {source_file}: weak taxonomic signal ({v.get('reason')}) -- "
+                  "NOT auto-included; review it yourself before deciding.")
+            continue
+        rows = to_long_rows(d, v, args.paper_id, args.dataset_id, source_file)
+        if rows.empty:
+            continue
+        try:
+            wide, dup = build_table_matrix(rows)
+        except MatrixTooLargeError as e:
+            print(f"  {source_file}: refusing to build matrix -- {e}")
+            continue
+        if wide.empty:
+            continue
+        safe_name = __import__("re").sub(r"[^A-Za-z0-9._-]", "_", f"{args.dataset_id}__{source_file}")[:150]
+        matrix_path = data_dir / f"{safe_name}.matrix.tsv"
+        long_path = data_dir / f"{safe_name}.long.tsv.gz"
+        wide.to_csv(matrix_path, sep="\t", index=False)
+        rows.to_csv(long_path, sep="\t", index=False, compression="gzip")
+        if not dup.empty:
+            dup.to_csv(data_dir / f"{safe_name}.duplicates.tsv", sep="\t", index=False)
+        blank_ids = sorted(rows.loc[rows["sample_flag"] == "blank_or_control", "sample_id"].unique().tolist())
+        seq_hints = sorted({h for h in rows["sequencing_type_hint"] if h})
+        new_tables.append({
+            "dataset_id": args.dataset_id, "source_file": source_file,
+            "matrix_path": str(matrix_path), "long_path": str(long_path),
+            "n_sample_ids_raw": int(rows["sample_id"].nunique()),
+            "n_verified_biological_samples": "",
+            "n_taxa": int(wide.shape[1] - 2),
+            "domains": ";".join(sorted(rows["domain"].unique())),
+            "sequencing_type_hints": ";".join(seq_hints),
+            "blank_or_control_sample_ids": ";".join(blank_ids),
+            "n_duplicate_cells": int(dup.shape[0]) if not dup.empty else 0,
+            "raw_file_sha256": manifest_row["sha256"],
+        })
+        print(f"  {source_file}: {wide.shape[0]} sample_ids x {wide.shape[1]-2} taxa -> {matrix_path}")
+
+    if not new_tables:
+        print(f"\nno abundance-shaped table accepted from {local.name} ({n_checked} sheet(s)/table(s) checked). "
+              "progress.jsonl was NOT modified -- this file doesn't get counted as a success.")
         return
-    if old_wide is not None:
-        wide = pd.concat([old_wide, wide], ignore_index=True).fillna(0)
-        # a sample appearing in both (re-ingesting the same file twice) should
-        # not be duplicated -- keep the newest values for any repeated sample_id.
-        wide = wide.drop_duplicates(subset="sample_id", keep="last")
 
-    data_dir = Path(args.data_dir); data_dir.mkdir(parents=True, exist_ok=True)
-    out_path = data_dir / f"{study_id}_abundance_matrix.tsv"
-    wide.to_csv(out_path, sep="\t", index=False)
-
-    new_rec = {"paper_id": args.paper_id, "status": "ok", "study_id": study_id,
-               "n_samples": int(wide.shape[0]), "n_taxa": int(wide.shape[1] - 2),
-               "matrix_path": str(out_path), "blocked_files": [],
-               "author_lookup_error": "", "domains": sorted(long_df["domain"].unique().tolist()),
-               "notes": f"manually ingested from {local.name} via manual_ingest.py"}
+    # Merge into the paper's EXISTING record (never replace its other
+    # already-extracted tables) -- this file ADDS tables, it never removes
+    # or overwrites ones from a prior automated or manual run.
+    if prior is not None:
+        merged_tables = prior.get("tables", []) + new_tables
+        new_rec = {**prior, "status": "ok", "study_id": study_id, "tables": merged_tables}
+    else:
+        new_rec = {"paper_id": args.paper_id, "status": "ok", "study_id": study_id,
+                   "tables": new_tables, "needs_review": [], "blocked_files": [],
+                   "author_lookup_error": ""}
 
     kept = [r for r in existing_records if r["paper_id"] != args.paper_id]
     kept.append(new_rec)
@@ -147,9 +177,8 @@ def main() -> None:
         for r in kept:
             f.write(json.dumps(r) + "\n")
 
-    print(f"\ndone. {wide.shape[0]} samples x {wide.shape[1]-2} taxa written to {out_path}")
-    print(f"progress.jsonl updated: {args.paper_id} is now status=ok, study_id={study_id!r}")
-    print("run the build phase next to get this into studies.tsv/sample.tsv.")
+    print(f"\ndone. {len(new_tables)} new table(s) added for {args.paper_id} (study_id={study_id!r}).")
+    print("run the build phase next to get this into studies.tsv/sample.tsv/table_manifest.tsv.")
 
 
 if __name__ == "__main__":

@@ -60,24 +60,33 @@ csv.field_size_limit(sys.maxsize)
 sys.path.insert(0, str((Path(__file__).resolve().parent.parent / "find_papers")))
 from stage6_verify_abundance import (          # noqa: E402
     list_deposit_files, stream_download, iter_tables, sniff_frame,
-    to_long_rows, check_dependencies,
+    to_long_rows, check_dependencies, retain_raw_file, append_raw_manifest, safe_pivot,
 )
 from _netutil import GLOBAL_THROTTLE           # noqa: E402
 
 UA = {"User-Agent": "microbiome-dataset-resolver/1.0 (academic research)"}
 
 STUDIES_FIELDS = ["study_id", "title", "doi", "pmid", "year", "disease", "body_site",
-                   "sample_type", "n_samples", "data_available", "sequencing_type",
-                   "sequencing_platform", "target_type", "available_abundance",
-                   "profiling_possible", "metadata_available", "repository",
+                   "sample_type", "n_tables", "n_sample_ids_raw_total", "n_verified_biological_samples",
+                   "data_available", "sequencing_type", "sequencing_platform", "target_type",
+                   "available_abundance", "profiling_possible", "metadata_available", "repository",
                    "submission_accession", "url", "include", "notes"]
-SAMPLE_FIELDS = ["study_id", "submission_accession", "sample_id", "participant_id",
+SAMPLE_FIELDS = ["study_id", "dataset_id", "source_file", "submission_accession", "sample_id",
+                  "sample_flag", "sequencing_type_hint", "participant_id",
                   "group", "disease_status", "age", "sex", "country", "city_location",
                   "specimen_type", "run_accession", "collection_year",
                   "sequencing_platform", "antibiotic_use", "treatment_medication",
                   "download_url", "notes"]
 BLOCKED_FIELDS = ["paper_id", "pmid", "pmcid", "doi", "title", "dataset_id", "repository",
                    "accession", "landing_url", "attempted_files", "reason", "notes"]
+# One row per (study, dataset, source_file) actually extracted -- the authoritative,
+# never-merged per-table manifest. studies.tsv/sample.tsv are convenience rollups;
+# THIS file is where n_sample_ids_raw/domains/flags/sha256 for any one table live.
+TABLE_MANIFEST_FIELDS = ["study_id", "paper_id", "dataset_id", "source_file", "matrix_path",
+                          "long_path", "n_sample_ids_raw", "n_verified_biological_samples",
+                          "n_taxa", "domains", "sequencing_type_hints",
+                          "blank_or_control_sample_ids", "n_duplicate_cells", "raw_file_sha256"]
+NEEDS_REVIEW_FIELDS = ["paper_id", "dataset_id", "source_file", "reason", "score"]
 
 # 1. study_id = FirstAuthorSurname_Year, via a lightweight Europe PMC lookup
 def _ascii_surname(raw: str) -> str:
@@ -172,33 +181,34 @@ def looks_like_challenge_page(path: Path) -> bool:
 # 3. wide matrix: pivot to_long_rows' output into sample_id x taxon, with
 #    virus_/prok_-prefixed column names and a `source` column
 class MatrixTooLargeError(Exception):
-    """Raised by build_wide_matrix() instead of letting pivot_table()
-    attempt a combinatorially huge reshape. A paper whose datasets contain
-    many largely non-overlapping small tables (each with its own taxon
-    vocabulary) can drive n_unique_samples x n_unique_taxa into the tens
-    of millions -- pivot_table's internal groupby/unstack multiplies that
-    several times over during the reshape, and this is the real mechanism
-    behind stage7 OOMing at values as high as 128G that plain per-worker
-    file-size budgets (--max-file-mb/--max-study-mb) do not bound at all
-    (those cap DOWNLOADED bytes, not the CARDINALITY of the accumulated
-    long-format table)."""
+    """Raised by build_table_matrix() instead of letting pivot_table()
+    attempt a combinatorially huge reshape. Even a SINGLE table (let alone
+    several merged together, which this stage no longer does by default)
+    can in principle have a pathological sample x taxon cardinality; this
+    guard stays per-table so one huge table cannot OOM the whole paper's
+    processing."""
 
 
-def build_wide_matrix(long_df, max_cells: int = 20_000_000):
-    """long_df: concatenated to_long_rows() output across all of a study's
-    datasets. Returns a wide pandas DataFrame: sample_id, source, then one
-    column per taxon (most-specific non-empty rank name), prefixed by
-    domain (virus_/prok_). Raises MatrixTooLargeError BEFORE calling
-    pivot_table if n_unique_samples * n_unique_taxa would exceed
-    max_cells (default 20M cells ~ 160MB of raw float64 data -- generous
-    for any real abundance matrix, which is normally thousands of taxa x
-    hundreds of samples at most, while still catching the pathological
-    high-cardinality case above by orders of magnitude before it can
-    exhaust node memory)."""
+def build_table_matrix(table_df, max_cells: int = 20_000_000):
+    """table_df: to_long_rows() output for ONE (dataset_id, source_file,
+    sub_table) -- NEVER multiple tables concatenated together; this
+    function does not merge anything across files, sheets, or sequencing
+    types. Returns (wide_df, dup_report):
+      wide_df: sample_id, source, then one column per taxon (genus_species
+        where both are known, else the most specific available rank,
+        prefixed virus_/prok_/unk_ by domain). A (sample, taxon) cell with
+        NO underlying row is left BLANK (NaN), never silently zero-filled.
+      dup_report: rows where the SAME (sample, taxon) pair had more than
+        one raw value within this one table -- these are surfaced, not
+        summed; the corresponding wide_df cell is left blank pending
+        manual resolution.
+    Raises MatrixTooLargeError before ever calling pivot_table if
+    n_unique_samples * n_unique_taxa would exceed max_cells (20M cells by
+    default, ~160MB of float64 -- generous for any single real table)."""
     import pandas as pd
-    if long_df.empty:
-        return pd.DataFrame()
-    df = long_df.copy()
+    if table_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    df = table_df.copy()
     rank_cols = ["genus", "family", "order", "class", "phylum", "kingdom"]
 
     def taxon_label(row):
@@ -212,7 +222,7 @@ def build_wide_matrix(long_df, max_cells: int = 20_000_000):
         return row.get("taxon", "unknown")
 
     df["taxon_label"] = df.apply(taxon_label, axis=1)
-    prefix = df["domain"].map({"virus": "virus_", "prokaryote": "prok_"}).fillna("prok_")
+    prefix = df["domain"].map({"virus": "virus_", "prokaryote": "prok_"}).fillna("unk_")
     df["col_name"] = prefix + df["taxon_label"].astype(str).str.replace(r"[^\w]+", "_", regex=True)
 
     n_samples = df["sample_id"].nunique()
@@ -221,18 +231,14 @@ def build_wide_matrix(long_df, max_cells: int = 20_000_000):
     if est_cells > max_cells:
         raise MatrixTooLargeError(
             f"{n_samples} unique samples x {n_cols} unique taxa = {est_cells:,} estimated cells "
-            f"(cap {max_cells:,}) -- refusing to pivot; likely many small, largely non-overlapping "
-            f"tables concatenated across this paper's datasets")
+            f"(cap {max_cells:,}) -- refusing to pivot this single table")
 
-    # a (sample, taxon) pair can appear more than once across multiple
-    # files/datasets for the same study -- sum rather than silently drop.
-    piv = df.pivot_table(index="sample_id", columns="col_name", values="value", aggfunc="sum", fill_value=0)
+    piv, dup = safe_pivot(df, "sample_id", "col_name", "value")
     piv = piv.reset_index()
-    # `source` records which dataset(s) contributed to each sample's row.
     src = df.groupby("sample_id")["dataset_id"].agg(lambda s: ";".join(sorted(set(s)))).rename("source")
     piv = piv.merge(src, on="sample_id", how="left")
     cols = ["sample_id", "source"] + [c for c in piv.columns if c not in ("sample_id", "source")]
-    return piv[cols]
+    return piv[cols], dup
 
 
 # 4. extract phase: one paper at a time -- download every abundance_ready
@@ -240,27 +246,45 @@ def build_wide_matrix(long_df, max_cells: int = 20_000_000):
 #    the outcome (including which files were anti-bot-blocked, if any)
 def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                    max_file_mb: float, max_study_mb: float, data_dir: Path,
-                   taken_study_ids: set[str], lock: threading.Lock) -> dict:
+                   taken_study_ids: set[str], lock: threading.Lock,
+                   raw_store: Path, raw_manifest_path: Path, raw_manifest_lock: threading.Lock) -> dict:
+    """Download every abundance_ready dataset/file this paper has, and for
+    EACH (dataset, file, sub_table) that passes sniff_frame as a real
+    abundance table, write its OWN matrix + long-format output -- never
+    merged with any other file, sheet, or sub_table, even from the same
+    paper or dataset. A paper that ends up with several tables ends up
+    with several output files side by side under data_dir/<study_id>/; it
+    is the user's call, made with the per-table manifest in hand, whether
+    any of them actually belong combined -- this function never guesses.
+    """
     paper_id = paper["paper_id"]
     study_dir = scratch / re.sub(r"[^A-Za-z0-9._-]", "_", paper_id)[:100]
-    all_long = []
-    blocked_files = []   # [(dataset_id, filename, reason)]
-    budget_used = 0.0
-    total_rows_accumulated = 0
-    # max_study_mb only bounds DOWNLOADED BYTES -- a paper anomalously
-    # linked to a huge number of small files/datasets (a stage5
-    # data-quality issue, not something this function can fix at the
-    # source) can still accumulate an unbounded number of small,
-    # string-heavy long-format rows in `all_long` before pd.concat() is
-    # ever called, which is BEFORE MatrixTooLargeError's cardinality
-    # check even runs -- concat itself can already exhaust memory. Cap
-    # total accumulated rows directly, independent of MB budget.
-    MAX_ACCUMULATED_ROWS = 2_000_000
-    row_cap_hit = False
+    blocked_files = []     # [(dataset_id, filename, reason)]
+    needs_review = []      # [{dataset_id, source_file, reason, score}]
+    tables_out = []        # one entry per (dataset, file, sub_table) actually written
+    study_id_box = [None]  # assigned lazily -- only once there is something to write
+
+    # Per-table row cap (NOT a whole-paper accumulation cap any more -- since
+    # tables are no longer concatenated across files, the OOM mechanism that
+    # motivated the old whole-paper cap no longer applies the same way; a
+    # single pathological table can still be huge, so it still gets capped).
+    MAX_TABLE_ROWS = 2_000_000
+
+    def get_study_id() -> str:
+        if study_id_box[0] is not None:
+            return study_id_box[0]
+        surname, year, err = fetch_first_author_year(paper.get("pmid", ""), paper.get("doi", ""))
+        with lock:
+            if surname and year:
+                sid = assign_study_id(surname, year, taken_study_ids)
+            else:
+                sid = f"paper{paper_id.replace('/', '_').replace(':', '_')[:40]}"
+            taken_study_ids.add(sid)
+        study_id_box[0] = sid
+        study_id_box.append(err)  # stash the author-lookup error alongside, read back below
+        return sid
 
     for ds in datasets:
-        if row_cap_hit:
-            break
         repo, acc, dsid = ds["repository"], ds["accession"], ds["dataset_id"]
         try:
             files = list_deposit_files(repo, acc)
@@ -268,44 +292,88 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
             blocked_files.append((dsid, "<listing>", f"list_deposit_files error: {e}"))
             continue
         for name, url, _size in files:
-            if row_cap_hit:
-                break
-            if budget_used > max_study_mb * 1e6 or not url:
+            if not url:
                 continue
             local = study_dir / re.sub(r"[^A-Za-z0-9._-]", "_", name)[:100]
             ok, status = stream_download(url, local, max_file_mb)
             if not ok:
                 blocked_files.append((dsid, name, f"download_failed:{status}"))
                 continue
-            budget_used += local.stat().st_size
+            # Raw-file retention: EVERY downloaded file is kept byte-for-byte,
+            # including ones that turn out to be anti-bot challenge pages --
+            # the retained copy is the proof of what was actually served.
+            manifest_row = retain_raw_file(local, raw_store, paper_id, dsid, repo, acc, url, name)
+            append_raw_manifest(raw_manifest_path, manifest_row, raw_manifest_lock)
+            local = Path(manifest_row["retained_path"])
+
             if looks_like_challenge_page(local):
                 blocked_files.append((dsid, name, "anti_bot_challenge_page"))
-                local.unlink(missing_ok=True)
                 continue
-            # iter_tables (stage6, shared code) SWALLOWS its own exceptions
-            # internally -- on a bad nested member (corrupt/mislabeled zip
-            # member, non-gzip ".gz", etc.) it just prints to stderr and the
-            # generator quietly yields fewer/no items, with nothing raised
-            # to this caller. Capture that stderr so ANY such internal
-            # failure -- not just the anti-bot case looks_like_challenge_page
-            # already catches -- gets a real, traceable reason in
-            # blocked_files instead of silently vanishing.
+            # iter_tables (stage6, shared code) SWALLOWS its own top-level
+            # exceptions internally (prints to stderr, yields nothing) --
+            # capture that stderr so a nested-member failure (corrupt zip
+            # member, mislabeled ".gz", ...) gets a real, traceable reason
+            # instead of silently vanishing. preview=False means this is a
+            # FULL read, not the row-capped structural preview -- the whole
+            # point of splitting the two apart.
             stderr_buf = io.StringIO()
+            bad_lines_log: list[str] = []
             try:
                 with contextlib.redirect_stderr(stderr_buf):
-                    for _sub_id, _hr, d in iter_tables(local):
+                    for sub_id, _hr, d in iter_tables(local, preview=False, bad_lines_log=bad_lines_log):
                         v = sniff_frame(d)
                         if not v["is_abundance"]:
                             continue
-                        rows = to_long_rows(d, v, paper_id, dsid, name)
-                        if not rows.empty:
-                            all_long.append(rows)
-                            total_rows_accumulated += len(rows)
-                            if total_rows_accumulated > MAX_ACCUMULATED_ROWS:
-                                blocked_files.append((dsid, name,
-                                    f"accumulation_capped:{total_rows_accumulated}_rows_exceeds_{MAX_ACCUMULATED_ROWS}"))
-                                row_cap_hit = True
-                                break
+                        source_file = f"{name}!{sub_id}"
+                        if v["needs_review"]:
+                            # Low-confidence tables are NEVER auto-included
+                            # in the formal output -- they go to a human
+                            # review queue instead.
+                            needs_review.append({"paper_id": paper_id, "dataset_id": dsid,
+                                                "source_file": source_file, "reason": v.get("reason", ""),
+                                                "score": round(v.get("score", 0), 3)})
+                            continue
+                        rows = to_long_rows(d, v, paper_id, dsid, source_file)
+                        if rows.empty:
+                            continue
+                        if len(rows) > MAX_TABLE_ROWS:
+                            blocked_files.append((dsid, source_file,
+                                f"table_too_large:{len(rows)}_rows_exceeds_{MAX_TABLE_ROWS}"))
+                            continue
+                        try:
+                            wide, dup = build_table_matrix(rows)
+                        except MatrixTooLargeError as e:
+                            blocked_files.append((dsid, source_file, f"matrix_too_large:{e}"))
+                            continue
+                        if wide.empty:
+                            blocked_files.append((dsid, source_file, "pivot_produced_empty_matrix"))
+                            continue
+
+                        study_id = get_study_id()
+                        study_out_dir = data_dir / study_id
+                        study_out_dir.mkdir(parents=True, exist_ok=True)
+                        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{dsid}__{source_file}")[:150]
+                        matrix_path = study_out_dir / f"{safe_name}.matrix.tsv"
+                        long_path = study_out_dir / f"{safe_name}.long.tsv.gz"
+                        wide.to_csv(matrix_path, sep="\t", index=False)
+                        rows.to_csv(long_path, sep="\t", index=False, compression="gzip")
+                        if not dup.empty:
+                            dup.to_csv(study_out_dir / f"{safe_name}.duplicates.tsv", sep="\t", index=False)
+
+                        blank_ids = sorted(rows.loc[rows["sample_flag"] == "blank_or_control", "sample_id"].unique().tolist())
+                        seq_hints = sorted({h for h in rows["sequencing_type_hint"] if h})
+                        tables_out.append({
+                            "dataset_id": dsid, "source_file": source_file,
+                            "matrix_path": str(matrix_path), "long_path": str(long_path),
+                            "n_sample_ids_raw": int(rows["sample_id"].nunique()),
+                            "n_verified_biological_samples": "",  # never auto-filled -- needs metadata to confirm
+                            "n_taxa": int(wide.shape[1] - 2),
+                            "domains": ";".join(sorted(rows["domain"].unique())),
+                            "sequencing_type_hints": ";".join(seq_hints),
+                            "blank_or_control_sample_ids": ";".join(blank_ids),
+                            "n_duplicate_cells": int(dup.shape[0]) if not dup.empty else 0,
+                            "raw_file_sha256": manifest_row["sha256"],
+                        })
             except Exception as e:                   # noqa: BLE001
                 blocked_files.append((dsid, name, f"parse_error:{type(e).__name__}"))
             captured = stderr_buf.getvalue().strip()
@@ -313,45 +381,39 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                 for eline in captured.splitlines():
                     if eline.strip():
                         blocked_files.append((dsid, name, f"iter_tables_internal_error:{eline.strip()}"))
-            local.unlink(missing_ok=True)
+            if bad_lines_log:
+                for bl in bad_lines_log:
+                    blocked_files.append((dsid, name, f"malformed_lines_recorded:{bl}"))
         gc.collect()
 
-    shutil.rmtree(study_dir, ignore_errors=True)
+    shutil.rmtree(study_dir, ignore_errors=True)  # scratch cleanup only -- raw_store is untouched
 
-    if not all_long:
-        return {"paper_id": paper_id, "status": "blocked", "study_id": "",
-                "n_samples": 0, "n_taxa": 0, "matrix_path": "",
-                "blocked_files": blocked_files, "error": ""}
+    if not tables_out:
+        return {"paper_id": paper_id, "status": "blocked", "study_id": study_id_box[0] or "",
+                "tables": [], "needs_review": needs_review, "blocked_files": blocked_files, "error": ""}
 
-    import pandas as pd
-    long_df = pd.concat(all_long, ignore_index=True)
-    try:
-        wide = build_wide_matrix(long_df)
-    except MatrixTooLargeError as e:
-        return {"paper_id": paper_id, "status": "blocked", "study_id": "",
-                "n_samples": 0, "n_taxa": 0, "matrix_path": "",
-                "blocked_files": blocked_files, "error": f"matrix_too_large:{e}"}
-    if wide.empty:
-        return {"paper_id": paper_id, "status": "blocked", "study_id": "",
-                "n_samples": 0, "n_taxa": 0, "matrix_path": "",
-                "blocked_files": blocked_files, "error": "pivot produced empty matrix"}
+    return {"paper_id": paper_id, "status": "ok", "study_id": study_id_box[0],
+            "tables": tables_out, "needs_review": needs_review, "blocked_files": blocked_files,
+            "author_lookup_error": study_id_box[1] if len(study_id_box) > 1 else ""}
 
-    surname, year, err = fetch_first_author_year(paper.get("pmid", ""), paper.get("doi", ""))
-    with lock:
-        if surname and year:
-            study_id = assign_study_id(surname, year, taken_study_ids)
-        else:
-            study_id = f"paper{paper_id.replace('/', '_').replace(':', '_')[:40]}"
-        taken_study_ids.add(study_id)
-
-    data_dir.mkdir(parents=True, exist_ok=True)
-    out_path = data_dir / f"{study_id}_abundance_matrix.tsv"
-    wide.to_csv(out_path, sep="\t", index=False)
-
-    return {"paper_id": paper_id, "status": "ok", "study_id": study_id,
-            "n_samples": int(wide.shape[0]), "n_taxa": int(wide.shape[1] - 2),
-            "matrix_path": str(out_path), "blocked_files": blocked_files,
-            "author_lookup_error": err, "domains": sorted(long_df["domain"].unique().tolist())}
+def parse_range(spec: str | None, n_pending: int) -> tuple[int, int]:
+    """'10' -> (0, 10) i.e. the first 10 pending papers (1-indexed display,
+    0-indexed slice). '20-30' -> (19, 30) i.e. pending papers 20 through 30
+    inclusive, by POSITION in the sorted pending list (not by paper_id).
+    None -> the whole pending list."""
+    if not spec:
+        return 0, n_pending
+    spec = spec.strip()
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        start, end = int(a), int(b)
+        if start < 1 or end < start:
+            raise ValueError(f"invalid --range {spec!r}: expected 'A-B' with 1 <= A <= B")
+        return start - 1, min(end, n_pending)
+    n = int(spec)
+    if n < 1:
+        raise ValueError(f"invalid --range {spec!r}: expected a positive integer or 'A-B'")
+    return 0, min(n, n_pending)
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
@@ -366,12 +428,16 @@ def cmd_extract(args: argparse.Namespace) -> None:
         ids = [x for x in p.get("dataset_ids", "").split(";") if x]
         return [by_ds_id[i] for i in ids if i in by_ds_id and by_ds_id[i].get("candidate_status") == "abundance_ready"]
 
+    if args.paper_id:
+        papers = [p for p in papers if p["paper_id"] == args.paper_id]
+        print(f"--paper-id given: restricting to {len(papers)} matching paper(s)")
     papers = sorted(papers, key=lambda p: p["paper_id"])  # deterministic order across resumed runs
     print(f"{len(papers)} abundance_ready papers")
 
+    progress_path = Path(args.progress)
     done_ids, taken_study_ids = set(), set()
-    if Path(args.progress).exists():
-        with open(args.progress, encoding="utf-8") as f:
+    if not args.rebuild and progress_path.exists():
+        with open(progress_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -380,18 +446,30 @@ def cmd_extract(args: argparse.Namespace) -> None:
                 done_ids.add(rec["paper_id"])
                 if rec.get("study_id"):
                     taken_study_ids.add(rec["study_id"])
-    pending = [p for p in papers if p["paper_id"] not in done_ids]
-    print(f"{len(done_ids)} already processed, {len(pending)} pending")
+    elif args.rebuild:
+        print(f"--rebuild: ignoring {progress_path} entirely -- every paper in --range is reprocessed "
+             f"from scratch, written to a NEW progress file; the old one is left untouched.")
+    pending_all = [p for p in papers if p["paper_id"] not in done_ids]
+    print(f"{len(done_ids)} already processed, {len(pending_all)} pending")
+
+    start, end = parse_range(args.range, len(pending_all))
+    pending = pending_all[start:end]
+    if args.range:
+        print(f"--range {args.range!r}: processing pending papers {start + 1}-{end} of {len(pending_all)} "
+             f"({len(pending)} papers this run)")
     if not pending:
         print("nothing to do -- run the build phase.")
         return
 
     scratch = Path(args.scratch); scratch.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir)
-    Path(args.progress).parent.mkdir(parents=True, exist_ok=True)
-    out_fh = open(args.progress, "a", encoding="utf-8")
+    raw_store = Path(args.raw_store); raw_store.mkdir(parents=True, exist_ok=True)
+    raw_manifest_path = Path(args.raw_manifest) if args.raw_manifest else raw_store / "raw_files_manifest.csv"
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    out_fh = open(progress_path, "a", encoding="utf-8")
     write_lock = threading.Lock()
     study_id_lock = threading.Lock()
+    raw_manifest_lock = threading.Lock()
     n_done = [0]
     t0 = time.time()
 
@@ -399,7 +477,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         ds = datasets_for(p)
         if not ds:
             rec = {"paper_id": p["paper_id"], "status": "blocked", "study_id": "",
-                   "n_samples": 0, "n_taxa": 0, "matrix_path": "",
+                   "tables": [], "needs_review": [],
                    "blocked_files": [], "error": "no abundance_ready dataset resolved for this paper"}
         else:
             # process_paper can, in principle, hit an exception its own
@@ -416,10 +494,11 @@ def cmd_extract(args: argparse.Namespace) -> None:
             # every other paper still gets processed and recorded.
             try:
                 rec = process_paper(p, ds, scratch, args.max_file_mb, args.max_study_mb,
-                                    data_dir, taken_study_ids, study_id_lock)
+                                    data_dir, taken_study_ids, study_id_lock,
+                                    raw_store, raw_manifest_path, raw_manifest_lock)
             except Exception as e:                   # noqa: BLE001
                 rec = {"paper_id": p["paper_id"], "status": "blocked", "study_id": "",
-                       "n_samples": 0, "n_taxa": 0, "matrix_path": "", "blocked_files": [],
+                       "tables": [], "needs_review": [], "blocked_files": [],
                        "error": f"process_paper_crashed:{type(e).__name__}:{e}"}
         with write_lock:
             out_fh.write(json.dumps(rec) + "\n")
@@ -436,7 +515,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         for fu in as_completed(futs):
             fu.result()
     out_fh.close()
-    print(f"done. {n_done[0]} papers processed this run.")
+    print(f"done. {n_done[0]} papers processed this run. progress written to {progress_path}")
 
 
 # 5. build phase: local-only merge into studies.tsv / sample.tsv / blocked
@@ -465,10 +544,10 @@ def cmd_build(args: argparse.Namespace) -> None:
         papers_by_id = {r["paper_id"]: r for r in csv.DictReader(f)}
 
     if not Path(args.progress).exists():
-        print(f"FATAL: {args.progress} does not exist -- run 'extract' first", file=sys.stderr)
+        print(f"FATAL: {args.progress} does not exist -- run \'extract\' first", file=sys.stderr)
         sys.exit(1)
 
-    studies_rows, sample_rows, blocked_rows = [], [], []
+    studies_rows, sample_rows, blocked_rows, table_rows, review_rows = [], [], [], [], []
     status_by_paper: dict[str, str] = {}
     with open(args.progress, encoding="utf-8") as f:
         for line in f:
@@ -481,46 +560,66 @@ def cmd_build(args: argparse.Namespace) -> None:
             if paper is None:
                 continue
 
-            if rec["status"] == "ok":
+            for rv in rec.get("needs_review", []):
+                review_rows.append({**{k: rv.get(k, "") for k in NEEDS_REVIEW_FIELDS}})
+
+            tables = rec.get("tables", [])
+            if rec["status"] == "ok" and tables:
                 repo_accs = sorted({(d.split(":", 1)[0], d.split(":", 1)[1])
                                     for d in (paper.get("dataset_ids") or "").split(";") if ":" in d})
+                n_raw_total = sum(t.get("n_sample_ids_raw", 0) for t in tables)
+                all_domains = sorted({dm for t in tables for dm in t.get("domains", "").split(";") if dm})
                 studies_rows.append({
                     "study_id": rec["study_id"], "title": paper.get("title", ""),
                     "doi": paper.get("doi", ""), "pmid": paper.get("pmid", ""),
                     "year": paper.get("publication_year", ""), "disease": "",
-                    "body_site": "", "sample_type": "", "n_samples": rec["n_samples"],
+                    "body_site": "", "sample_type": "",
+                    "n_tables": len(tables),
+                    "n_sample_ids_raw_total": n_raw_total,  # SUM across tables -- NOT deduplicated; the
+                                                             # same sample_id in two different tables is
+                                                             # counted twice here on purpose, since this
+                                                             # stage never asserts those are the same
+                                                             # biological sample across different tables.
+                    "n_verified_biological_samples": "",    # never auto-filled -- needs metadata to confirm
                     "data_available": "processed",
                     "sequencing_type": "", "sequencing_platform": "",
-                    "target_type": "+".join(rec.get("domains", [])),
-                    "available_abundance": "yes", "profiling_possible": "from_matrix",
+                    "target_type": "+".join(all_domains),
+                    "available_abundance": "yes", "profiling_possible": "from_per_table_matrices",
                     "metadata_available": "no",
                     "repository": ";".join(sorted({r for r, _ in repo_accs})),
                     "submission_accession": ";".join(a for _, a in repo_accs),
                     "url": f"https://pmc.ncbi.nlm.nih.gov/articles/{paper.get('pmcid','')}/" if paper.get("pmcid") else "",
                     "include": "yes",
-                    "notes": (f"extracted {rec['n_samples']} samples x {rec['n_taxa']} taxa "
-                              f"from {rec['matrix_path']}."
+                    "notes": (f"{len(tables)} separate table(s) extracted, NOT merged -- see "
+                              f"table_manifest.tsv for per-table sample/taxon counts, domains, and flags."
                               + (f" author lookup failed ({rec.get('author_lookup_error')}) "
                                  "-- study_id falls back to paper_id." if rec.get("author_lookup_error") else "")),
                 })
-                import csv as _csv  # local alias, avoids shadowing concerns
-                try:
-                    with open(rec["matrix_path"], newline="", encoding="utf-8") as mf:
-                        for row in _csv.DictReader(mf, delimiter="\t"):
-                            sample_rows.append({
-                                "study_id": rec["study_id"],
-                                "submission_accession": ";".join(a for _, a in repo_accs),
-                                "sample_id": row.get("sample_id", ""),
-                                "participant_id": "", "group": "", "disease_status": "",
-                                "age": "", "sex": "", "country": "", "city_location": "",
-                                "specimen_type": "", "run_accession": "", "collection_year": "",
-                                "sequencing_platform": "", "antibiotic_use": "",
-                                "treatment_medication": "", "download_url": "",
-                                "notes": "clinical/demographic fields not extracted at this stage "
-                                        "-- only machine-derivable identifiers populated",
-                            })
-                except FileNotFoundError:
-                    pass
+                for t in tables:
+                    table_rows.append({"study_id": rec["study_id"], "paper_id": rec["paper_id"],
+                                       **{k: t.get(k, "") for k in TABLE_MANIFEST_FIELDS
+                                          if k not in ("study_id", "paper_id")}})
+                    try:
+                        with open(t["matrix_path"], newline="", encoding="utf-8") as mf:
+                            for row in csv.DictReader(mf, delimiter="\t"):
+                                sample_rows.append({
+                                    "study_id": rec["study_id"], "dataset_id": t["dataset_id"],
+                                    "source_file": t["source_file"],
+                                    "submission_accession": ";".join(a for _, a in repo_accs),
+                                    "sample_id": row.get("sample_id", ""),
+                                    "sample_flag": "blank_or_control" if row.get("sample_id", "") in
+                                                  set(t.get("blank_or_control_sample_ids", "").split(";")) else "",
+                                    "sequencing_type_hint": t.get("sequencing_type_hints", ""),
+                                    "participant_id": "", "group": "", "disease_status": "",
+                                    "age": "", "sex": "", "country": "", "city_location": "",
+                                    "specimen_type": "", "run_accession": "", "collection_year": "",
+                                    "sequencing_platform": "", "antibiotic_use": "",
+                                    "treatment_medication": "", "download_url": "",
+                                    "notes": "clinical/demographic fields not extracted at this stage "
+                                            "-- only machine-derivable identifiers populated",
+                                })
+                    except FileNotFoundError:
+                        pass
 
             if rec["status"] == "blocked" or rec.get("blocked_files"):
                 reasons = rec.get("blocked_files", []) or [("", "", rec.get("error", "no dataset resolved"))]
@@ -537,31 +636,42 @@ def cmd_build(args: argparse.Namespace) -> None:
                                 if reason == "anti_bot_challenge_page" else "",
                     })
 
-    print(f"studies: {len(studies_rows)}   samples: {len(sample_rows)}   blocked entries: {len(blocked_rows)}")
+    print(f"studies: {len(studies_rows)}   tables: {len(table_rows)}   samples: {len(sample_rows)}   "
+          f"needs_review: {len(review_rows)}   blocked entries: {len(blocked_rows)}")
     n1 = append_tsv(Path(args.studies_tsv), STUDIES_FIELDS, studies_rows, key_fields=("study_id",))
-    n2 = append_tsv(Path(args.sample_tsv), SAMPLE_FIELDS, sample_rows, key_fields=("study_id", "sample_id"))
+    n2 = append_tsv(Path(args.sample_tsv), SAMPLE_FIELDS, sample_rows,
+                    key_fields=("study_id", "dataset_id", "source_file", "sample_id"))
     n3 = append_tsv(Path(args.blocked_tsv), BLOCKED_FIELDS, blocked_rows,
                     key_fields=("paper_id", "dataset_id", "attempted_files"))
-    print(f"wrote {n1} new study rows, {n2} new sample rows, {n3} new blocked entries "
+    n4 = append_tsv(Path(args.table_manifest_tsv), TABLE_MANIFEST_FIELDS, table_rows,
+                    key_fields=("study_id", "dataset_id", "source_file"))
+    n5 = append_tsv(Path(args.needs_review_tsv), NEEDS_REVIEW_FIELDS, review_rows,
+                    key_fields=("paper_id", "dataset_id", "source_file"))
+    print(f"wrote {n1} new study rows, {n2} new sample rows, {n3} new blocked entries, "
+          f"{n4} new table-manifest rows, {n5} new needs-review rows "
           f"(rows already present from an earlier build run were skipped)")
     # blocked_rows mixes two DIFFERENT situations that must not be reported
-    # as one number: a paper with status=="blocked" never produced a matrix
-    # at all, while a paper with status=="ok" but non-empty blocked_files
-    # DID get a matrix -- just possibly missing whatever those specific
-    # blocked files would have contributed. Conflating them as "had every
-    # file blocked" is simply false for the second group.
+    # as one number: a paper with status=="blocked" never produced ANY
+    # table at all, while a paper with status=="ok" but non-empty
+    # blocked_files DID get at least one table -- just possibly missing
+    # whatever those specific blocked files would have contributed.
+    # Conflating them as "had every file blocked" is simply false for the
+    # second group.
     fully_blocked_papers = {r["paper_id"] for r in blocked_rows
                             if status_by_paper.get(r["paper_id"]) == "blocked"}
     partial_papers = {r["paper_id"] for r in blocked_rows} - fully_blocked_papers
-    print(f"\n{len(studies_rows)} studies got a matrix written to disk.")
+    print(f"\n{len(studies_rows)} studies got >=1 table written to disk ({len(table_rows)} tables total, "
+          f"never merged across files/sheets).")
     print(f"{len(fully_blocked_papers)} abundance_ready papers had EVERY file blocked "
-          f"(no matrix produced at all) -- see {args.blocked_tsv} for which ones and why "
+          f"(no table produced at all) -- see {args.blocked_tsv} for which ones and why "
           f"(most commonly anti_bot_challenge_page = manual browser download needed).")
     if partial_papers:
-        print(f"{len(partial_papers)} more papers DID get a matrix, but had one or more "
+        print(f"{len(partial_papers)} more papers DID get at least one table, but had one or more "
               f"individual files blocked (possible missing data, not a total failure) -- "
               f"same {args.blocked_tsv}, look up these paper_ids to see which files/reasons.")
-
+    if review_rows:
+        print(f"{len(review_rows)} low-confidence tables need a human to open and check -- "
+              f"see {args.needs_review_tsv}.")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -573,9 +683,33 @@ def main() -> None:
     ep.add_argument("--data-dir", required=True)
     ep.add_argument("--progress", required=True)
     ep.add_argument("--scratch", required=True)
+    ep.add_argument("--raw-store", required=True,
+                    help="permanent, byte-for-byte retained copy of every downloaded file "
+                         "(including anti-bot challenge pages), keyed by paper_id/dataset_id/filename. "
+                         "Never deleted by this script; this is the audit trail behind every row.")
+    ep.add_argument("--raw-manifest", default=None,
+                    help="CSV recording source URL/repository/accession/filename/SHA256 for every "
+                         "retained raw file. Defaults to <raw-store>/raw_files_manifest.csv.")
     ep.add_argument("--workers", type=int, default=8)
     ep.add_argument("--max-file-mb", type=float, default=200)
     ep.add_argument("--max-study-mb", type=float, default=500)
+    ep.add_argument("--range", default=None,
+                    help="Scope this run to a slice of the PENDING paper list (after skipping "
+                         "already-done ones), by position -- not paper_id. A bare integer N processes "
+                         "the first N pending papers (e.g. '10' = pending papers 1-10). 'A-B' processes "
+                         "pending papers A through B inclusive (e.g. '20-30'). Omit to process everything "
+                         "pending. Combine with --rebuild to force-reprocess a specific slice.")
+    ep.add_argument("--paper-id", default=None,
+                    help="Restrict this run to exactly one paper_id (e.g. for the Goodall_2026-style "
+                         "single-paper verification pass). Applied before --range.")
+    ep.add_argument("--rebuild", action="store_true",
+                    help="Ignore --progress entirely when deciding what is 'already done' -- every "
+                         "paper selected by --paper-id/--range is reprocessed from scratch. Results are "
+                         "APPENDED to the same --progress file you pass (so point --progress at a NEW "
+                         "path, e.g. progress_rebuild_<date>.jsonl, to keep the old progress.jsonl and "
+                         "its old matrices/long tables completely untouched for side-by-side comparison; "
+                         "pointing --rebuild at the OLD progress file would duplicate rows for any "
+                         "paper_id appearing in both old and new runs instead of replacing them).")
 
     bp = sub.add_parser("build", help="local phase: assemble studies.tsv/sample.tsv/blocked list")
     bp.add_argument("--abundance-ready", required=True)
@@ -583,6 +717,12 @@ def main() -> None:
     bp.add_argument("--studies-tsv", required=True)
     bp.add_argument("--sample-tsv", required=True)
     bp.add_argument("--blocked-tsv", required=True)
+    bp.add_argument("--table-manifest-tsv", required=True,
+                    help="one row per (study, dataset, source_file) actually extracted -- the "
+                         "authoritative per-table manifest (n_sample_ids_raw, domains, flags, SHA256).")
+    bp.add_argument("--needs-review-tsv", required=True,
+                    help="low-confidence tables (weak taxonomic signal) that were NOT auto-included "
+                         "in any output -- queue for a human to open and judge.")
 
     args = ap.parse_args()
     if args.cmd == "extract":

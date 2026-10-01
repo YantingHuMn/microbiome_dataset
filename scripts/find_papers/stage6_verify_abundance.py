@@ -73,8 +73,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import gc
 import gzip
+import hashlib
 import io
 import json
 import re
@@ -122,6 +124,111 @@ RANK_PREFIX = {"d": "kingdom", "k": "kingdom", "p": "phylum", "c": "class",
                "o": "order", "f": "family", "g": "genus", "s": "species"}
 MIN_TAXA_FRACTION = 0.50
 REVIEW_TAXA_FRACTION = 0.30
+
+# Domain classification evidence (used by to_long_rows). The ONLY two taxon
+# domains asserted with no supporting evidence used to be "virus" (matched)
+# or "prokaryote" (the unconditional else-branch) -- silently mislabeling
+# fungi, host/COI reads, and genuinely-unclassified OTUs as prokaryote.
+# Now: virus needs a virus-family match, prokaryote needs its OWN positive
+# match (rank-prefixed Bacteria/Archaea or a recognized bacterial/archaeal
+# clade keyword), and anything matching neither is "unknown" -- the
+# original taxon string is always preserved regardless of the domain call.
+VIRUS_RE = re.compile(r"(?:virus|viridae|virales|phage)", re.I)
+PROKARYOTE_RE = re.compile(
+    r"(?:\bbacteria\b|\barchaea\b|bacteriota|proteobacteria|firmicutes|"
+    r"bacteroidetes|bacteroidota|actinobacteri|cyanobacteria|verrucomicrobi|"
+    r"spirochaet|chlamydiae|tenericutes|fusobacteri|euryarchaeota|"
+    r"crenarchaeota|thaumarchaeota|coccus\b|bacillus\b|monas\b|bacter\b|"
+    r"vibrio\b|spirillum\b|clostridium\b|prevotella\b|bacteroides\b|"
+    r"lactobacillus\b|bifidobacterium\b|akkermansia\b|faecalibacterium\b)",
+    re.I)
+
+# Sample-ID patterns that must be FLAGGED, never silently dropped or merged,
+# until a human (or real metadata) confirms what to do with them.
+BLANK_CONTROL_RE = re.compile(
+    r"(?:^|[_\-\s])(?:blank|ntc|neg(?:ctrl|[_\-]?control)?|mock|zymo|"
+    r"pos(?:ctrl|[_\-]?control)?|extraction[_\-]?control)\d*(?:$|[_\-\s])", re.I)
+SEQ_TYPE_HINT_RE = re.compile(r"(16s|18s|its\d?|coi|wgs|shotgun|metagenom|metatranscript)", re.I)
+
+
+def classify_domain(taxon: str) -> tuple[str, str]:
+    """(domain, evidence). Never defaults to a specific domain without a
+    positive match -- "unknown" is the correct answer when the taxon string
+    gives no real evidence either way, not a guess."""
+    t = str(taxon or "")
+    m = VIRUS_RE.search(t)
+    if m:
+        return "virus", f"matched virus pattern {m.group(0)!r}"
+    m = PROKARYOTE_RE.search(t)
+    if m:
+        return "prokaryote", f"matched prokaryote pattern {m.group(0)!r}"
+    return "unknown", "no virus or prokaryote keyword matched -- could be fungi, host/COI, or an unclassified OTU"
+
+
+def sample_flags(sample_id: str, source_file: str = "") -> tuple[str, str]:
+    """(blank_or_control_flag, sequencing_type_hint). Flags only -- callers
+    must never use these to silently drop or merge samples; they exist so a
+    human reviewing the output can decide."""
+    is_blank = bool(BLANK_CONTROL_RE.search(str(sample_id or "")))
+    hint_m = SEQ_TYPE_HINT_RE.search(f"{sample_id} {source_file}")
+    return ("blank_or_control" if is_blank else ""), (hint_m.group(1).upper() if hint_m else "")
+
+
+# --------------------------------------------------------------------------- #
+# raw-file retention -- every file this stage downloads is kept permanently,
+# byte-for-byte, with its provenance recorded. Nothing here may modify the
+# downloaded bytes; this is the audit trail that lets a human re-open the
+# EXACT file that produced any given row, independent of whatever this
+# script's parsing logic concluded about it.
+# --------------------------------------------------------------------------- #
+
+RAW_MANIFEST_FIELDS = ["paper_id", "dataset_id", "repository", "accession",
+                       "source_url", "original_filename", "retained_path",
+                       "sha256", "size_bytes", "downloaded_at"]
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def retain_raw_file(local: Path, raw_store: Path, paper_id: str, dataset_id: str,
+                    repo: str, acc: str, source_url: str, original_filename: str) -> dict:
+    """Move `local` (a just-downloaded file) into the permanent raw store at
+    <raw_store>/<paper_id>/<dataset_id>/<original_filename-sanitised>, compute
+    its SHA256 from the RETAINED copy (so the hash always matches what's on
+    disk), and return a manifest row. Never deletes or edits the content."""
+    dest_dir = raw_store / re.sub(r"[^A-Za-z0-9._-]", "_", paper_id)[:80] / \
+              re.sub(r"[^A-Za-z0-9._-]", "_", dataset_id)[:80]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / re.sub(r"[^A-Za-z0-9._-]", "_", original_filename)[:150]
+    if dest.exists() and dest.stat().st_size == local.stat().st_size:
+        # Already retained (e.g. a resumed/rebuilt run re-downloading the
+        # same file) -- do not overwrite; the existing copy is the record.
+        local.unlink(missing_ok=True)
+    else:
+        shutil.move(str(local), str(dest))
+    return {
+        "paper_id": paper_id, "dataset_id": dataset_id, "repository": repo, "accession": acc,
+        "source_url": source_url, "original_filename": original_filename,
+        "retained_path": str(dest), "sha256": sha256_of(dest), "size_bytes": dest.stat().st_size,
+        "downloaded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def append_raw_manifest(manifest_path: Path, row: dict, lock: threading.Lock | None = None) -> None:
+    lock_ctx = lock if lock is not None else threading.Lock()
+    with lock_ctx:
+        write_header = not manifest_path.exists()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=RAW_MANIFEST_FIELDS)
+            if write_header:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in RAW_MANIFEST_FIELDS})
 
 # Every accepted dataset is either a matrix someone already produced
 # (processed) or reads still needing OUR pipeline (raw_reads is never
@@ -276,9 +383,24 @@ def taxa_fraction(values) -> float:
     return sum(bool(TAXA_RE.search(v)) for v in vals) / len(vals)
 
 
-def iter_tables(path: Path, depth: int = 0):
+def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log: list | None = None):
     """Yield (sub_id, header_row, DataFrame). Recurses into zip/gz, including
-    nested zips (MDPI/OUP) and QIIME2 .qza artifacts."""
+    nested zips (MDPI/OUP) and QIIME2 .qza artifacts.
+
+    preview=True (default): cheap structural look used by sniff_frame() to
+    SCORE a candidate table -- capped at nrows=2000 and silently skips
+    malformed CSV lines (on_bad_lines="skip"), because at this stage we are
+    only deciding whether a table looks abundance-shaped at all, not
+    extracting real values.
+
+    preview=False: the FORMAL extraction pass. Reads the COMPLETE table (no
+    row cap on Excel), and instead of silently skipping malformed CSV/TSV
+    lines, captures each one (line number + raw content) into
+    `bad_lines_log` so a truncated/corrupted row is a recorded fact in the
+    output, never a silent gap. Callers doing real extraction MUST pass
+    preview=False -- using the preview pass for the actual output is exactly
+    the truncation bug this split exists to fix.
+    """
     import pandas as pd  # local import: keeps stage0-5 dependency-free
     if depth > 3:
         return
@@ -296,7 +418,7 @@ def iter_tables(path: Path, depth: int = 0):
                     with z.open(info) as src, open(tmp, "wb") as out:
                         shutil.copyfileobj(src, out)
                     try:
-                        for sid, hr, d in iter_tables(tmp, depth + 1):
+                        for sid, hr, d in iter_tables(tmp, depth + 1, preview=preview, bad_lines_log=bad_lines_log):
                             yield f"{inner.name}!{sid}", hr, d
                     finally:
                         tmp.unlink(missing_ok=True)
@@ -308,7 +430,7 @@ def iter_tables(path: Path, depth: int = 0):
                         with z.open(info) as src, open(tmp, "wb") as out:
                             shutil.copyfileobj(src, out)
                         try:
-                            for sid, hr, d in iter_tables(tmp, depth + 1):
+                            for sid, hr, d in iter_tables(tmp, depth + 1, preview=preview, bad_lines_log=bad_lines_log):
                                 yield f"qza!{sid}", hr, d
                         finally:
                             tmp.unlink(missing_ok=True)
@@ -317,7 +439,7 @@ def iter_tables(path: Path, depth: int = 0):
             with gzip.open(path, "rb") as fi, open(inner, "wb") as fo:
                 shutil.copyfileobj(fi, fo)
             try:
-                yield from iter_tables(inner, depth + 1)
+                yield from iter_tables(inner, depth + 1, preview=preview, bad_lines_log=bad_lines_log)
             finally:
                 inner.unlink(missing_ok=True)
         elif suf in (".xlsx", ".xls"):
@@ -325,7 +447,7 @@ def iter_tables(path: Path, depth: int = 0):
             for sh in xl.sheet_names:
                 for hr in range(0, 3):
                     try:
-                        d = xl.parse(sh, header=hr, nrows=2000)
+                        d = xl.parse(sh, header=hr, nrows=2000 if preview else None)
                     except Exception:                # noqa: BLE001
                         break
                     if d.shape[1] >= 2 and d.notna().sum().sum() > 0:
@@ -333,15 +455,47 @@ def iter_tables(path: Path, depth: int = 0):
                     if hr == 0 and d.shape[1] >= 3:
                         break
         else:
-            for sep in (",", "\t", ";"):
-                try:
-                    d = pd.read_csv(path, sep=sep, nrows=2000, engine="python",
-                                    on_bad_lines="skip")
-                except Exception:                    # noqa: BLE001
-                    continue
-                if d.shape[1] > 1:
+            if preview:
+                for sep in (",", "\t", ";"):
+                    try:
+                        d = pd.read_csv(path, sep=sep, nrows=2000, engine="python",
+                                        on_bad_lines="skip")
+                    except Exception:                # noqa: BLE001
+                        continue
+                    if d.shape[1] > 1:
+                        yield path.name, 0, d
+                        break
+            else:
+                # Full-read pass: do NOT stop at the first separator that merely
+                # parses without raising -- a wrong separator (e.g. ";" when the
+                # real delimiter is "\t") can still "succeed" while classifying
+                # nearly every line as malformed, which is exactly the false
+                # signal this fix exists to prevent. Try every separator, keep
+                # the one that actually fits the data: most columns first (the
+                # real delimiter produces the real column count), ties broken
+                # by fewest malformed lines.
+                candidates = []  # (n_cols, -n_bad, sep, df, bad_lines)
+                for sep in (",", "\t", ";"):
+                    bad_here: list[str] = []
+
+                    def _record_bad_line(bad_line, _bad=bad_here):
+                        _bad.append(",".join(str(x) for x in bad_line))
+                        return None  # drop the line from the parsed frame, but it is now recorded
+
+                    try:
+                        d_try = pd.read_csv(path, sep=sep, engine="python", on_bad_lines=_record_bad_line)
+                    except Exception:                # noqa: BLE001
+                        continue
+                    if d_try.shape[1] > 1:
+                        candidates.append((d_try.shape[1], -len(bad_here), sep, d_try, bad_here))
+                if candidates:
+                    candidates.sort(reverse=True)
+                    _, _, best_sep, d, bad_here = candidates[0]
+                    if bad_here and bad_lines_log is not None:
+                        bad_lines_log.append(
+                            f"{path.name} [sep={best_sep!r}]: {len(bad_here)} malformed line(s) dropped: "
+                            + " | ".join(bad_here[:10]) + (" ..." if len(bad_here) > 10 else ""))
                     yield path.name, 0, d
-                    break
     except Exception as e:                           # noqa: BLE001
         print(f"    iter_tables error on {path.name}: {e}", file=sys.stderr)
 
@@ -407,6 +561,35 @@ def sniff_frame(d) -> dict:
     return v
 
 
+def safe_pivot(g, index_col: str, columns_col: str, values_col: str):
+    """Pivot WITHOUT the two silent-corruption defaults this whole fix exists
+    to remove: aggfunc="sum" (which adds together duplicate (index, columns)
+    records as if they were independent measurements) and fill_value=0
+    (which turns a (index, columns) PAIR THAT NEVER APPEARED IN THE DATA
+    into a false zero, indistinguishable from "measured and found to be
+    zero"). Duplicates are recorded and surfaced via a cell marker instead
+    of being summed; missing combinations are left as NaN (-> empty cell in
+    the written TSV), never 0. Returns (pivoted_df, duplicate_report) where
+    duplicate_report is a DataFrame of every (index, columns) pair that had
+    more than one raw value, with all of them listed.
+    """
+    import pandas as pd
+    dup_mask = g.duplicated(subset=[index_col, columns_col], keep=False)
+    dup_report = (g[dup_mask]
+                 .groupby([index_col, columns_col])[values_col]
+                 .apply(lambda s: ";".join(str(v) for v in s))
+                 .reset_index(name="raw_values")) if dup_mask.any() else g.iloc[0:0][[index_col, columns_col]].assign(raw_values="")
+
+    def _collapse(s):
+        if len(s) == 1:
+            return s.iloc[0]
+        return float("nan")  # the duplicate IS reported separately; the cell itself is left blank
+                              # rather than guessing which of several raw values (or their sum) is correct
+
+    piv = g.pivot_table(index=index_col, columns=columns_col, values=values_col, aggfunc=_collapse)
+    return piv, dup_report
+
+
 def split_taxonomy(label: str) -> dict[str, str]:
     out = {r: "" for r in RANKS}
     parts = re.split(r"[;|]", str(label or ""))
@@ -455,9 +638,16 @@ def to_long_rows(d, verdict: dict, paper_id: str, dataset_id: str, source_file: 
             out = num.copy()
             out.insert(0, "sample_id", d[idx].astype(str).values)
             out = out.melt(id_vars="sample_id", var_name="taxon", value_name="value")
-    out = out.dropna(subset=["value"])
+    # NOTE: values are NOT dropped here for being NaN/missing -- a missing
+    # (sample, taxon) combination is itself information (not measured /
+    # not reported), and must survive into the output as an explicit
+    # missing marker rather than being silently discarded before the
+    # caller ever sees it. Only rows where EVERYTHING is unusable (no
+    # sample_id or no taxon at all) are dropped.
+    out["is_missing"] = out["value"].isna() | (out["value"].astype(str).str.strip() == "")
+    out["value_raw"] = out["value"].astype(str)
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    out = out.dropna(subset=["value"])
+    out = out.dropna(subset=["sample_id", "taxon"], how="any")
     if out.empty:
         return out
     out["sample_id"] = out["sample_id"].astype(str).str.strip()
@@ -468,9 +658,12 @@ def to_long_rows(d, verdict: dict, paper_id: str, dataset_id: str, source_file: 
     out["dataset_id"] = dataset_id
     out["value_type"] = verdict.get("value_type", "unknown")
     out["source_file"] = source_file
-    out["domain"] = np.where(
-        out["taxon"].str.contains(r"(?:virus|viridae|virales|phage)", case=False,
-                                  regex=True, na=False), "virus", "prokaryote")
+    domain_evidence = out["taxon"].map(classify_domain)
+    out["domain"] = domain_evidence.map(lambda t: t[0])
+    out["domain_evidence"] = domain_evidence.map(lambda t: t[1])
+    flags = out["sample_id"].map(lambda s: sample_flags(s, source_file))
+    out["sample_flag"] = flags.map(lambda t: t[0])
+    out["sequencing_type_hint"] = flags.map(lambda t: t[1])
     return out
 
 
@@ -480,9 +673,14 @@ def to_long_rows(d, verdict: dict, paper_id: str, dataset_id: str, source_file: 
 
 def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: float,
                    long_path: Path, matrices_dir: Path,
-                   long_lock: threading.Lock | None = None) -> dict:
+                   long_lock: threading.Lock | None = None,
+                   raw_store: Path | None = None, raw_manifest_path: Path | None = None,
+                   raw_manifest_lock: threading.Lock | None = None,
+                   needs_review_path: Path | None = None,
+                   needs_review_lock: threading.Lock | None = None) -> dict:
     repo, acc, dsid = row["repository"], row["accession"], row["dataset_id"]
     paper_ids = row.get("paper_ids", "")
+    paper_id_for_rows = paper_ids.split(";")[0] if paper_ids else ""
     study_dir = scratch / re.sub(r"[^A-Za-z0-9._-]", "_", dsid)[:100]
     verdicts = []
     budget_used = 0.0
@@ -505,21 +703,54 @@ def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: f
                 verdicts.append({"file": name, "verdict": f"download_failed:{status}"})
                 continue
             budget_used += local.stat().st_size
+            local_size = local.stat().st_size
+            # Raw-file retention: the formal extraction pass in THIS function
+            # is the one place abundance_ready status gets asserted from, so
+            # it is the one place that MUST keep the byte-for-byte source of
+            # that assertion, not just the delete-after-parse the old code did.
+            if raw_store is not None:
+                manifest_row = retain_raw_file(local, raw_store, paper_id_for_rows, dsid, repo, acc, url, name)
+                if raw_manifest_path is not None:
+                    append_raw_manifest(raw_manifest_path, manifest_row, raw_manifest_lock)
+                local = Path(manifest_row["retained_path"])  # re-point at the retained copy for parsing below
             n_checked = n_accepted = 0
             pipelines_found = set()
-            for sub_id, hr, d in iter_tables(local):
+            bad_lines_log: list[str] = []
+            for sub_id, hr, d in iter_tables(local, preview=False, bad_lines_log=bad_lines_log):
                 n_checked += 1
                 v = sniff_frame(d)
                 if not v["is_abundance"]:
                     continue
-                n_accepted += 1
                 pipe = detect_pipeline(name, sub_id, " ".join(str(c) for c in d.columns))
                 if pipe:
                     pipelines_found.update(pipe.split(";"))
-                long_rows = to_long_rows(d, v, paper_ids.split(";")[0] if paper_ids else "",
-                                         dsid, f"{name}!{sub_id}")
+                if v["needs_review"]:
+                    # Low-confidence tables go to a human review queue, NOT
+                    # into the formal abundance output -- they are not
+                    # "accepted" just because is_abundance happened to be
+                    # True at a 30-50% taxonomic-signal threshold.
+                    if needs_review_path is not None:
+                        rec = {"paper_id": paper_id_for_rows, "dataset_id": dsid,
+                              "source_file": f"{name}!{sub_id}", "reason": v.get("reason", ""),
+                              "score": round(v.get("score", 0), 3), "axis": v.get("axis", "")}
+                        lock_ctx = needs_review_lock if needs_review_lock is not None else threading.Lock()
+                        with lock_ctx:
+                            write_header = not needs_review_path.exists()
+                            needs_review_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(needs_review_path, "a", newline="", encoding="utf-8") as nf:
+                                nw = csv.DictWriter(nf, fieldnames=list(rec))
+                                if write_header:
+                                    nw.writeheader()
+                                nw.writerow(rec)
+                    verdicts.append({"file": f"{name}!{sub_id}", "verdict": "needs_review",
+                                     "axis": v.get("axis", ""), "value_type": v.get("value_type", ""),
+                                     "pipeline": pipe, "score": round(v.get("score", 0), 3)})
+                    continue
+                n_accepted += 1
+                long_rows = to_long_rows(d, v, paper_id_for_rows, dsid, f"{name}!{sub_id}")
                 if not long_rows.empty:
                     long_rows["pipeline_source"] = pipe
+                    long_rows["raw_file_sha256"] = manifest_row["sha256"] if raw_store is not None else ""
                     # check-exists + append must be atomic across worker
                     # threads, or two datasets writing "first ever" rows at
                     # the same moment can both see "no file yet" and both
@@ -530,21 +761,24 @@ def verify_dataset(row: dict, scratch: Path, max_file_mb: float, max_study_mb: f
                         long_rows.to_csv(long_path, sep="\t", index=False, mode="a",
                                          header=write_header, compression="gzip" if long_path.suffix == ".gz" else None)
                     n_rows_written += len(long_rows)
-                verdicts.append({"file": f"{name}!{sub_id}", "verdict": "accepted" if not v["needs_review"] else "needs_review",
+                verdicts.append({"file": f"{name}!{sub_id}", "verdict": "accepted",
                                  "axis": v.get("axis", ""), "value_type": v.get("value_type", ""),
                                  "pipeline": pipe, "score": round(v.get("score", 0), 3)})
-            local.unlink(missing_ok=True)  # always drop the raw file, verified or not
+            if bad_lines_log:
+                verdicts.append({"file": name, "verdict": "parse_warnings", "bad_lines": bad_lines_log[:5]})
+            if raw_store is None:
+                local.unlink(missing_ok=True)  # retention disabled -- old delete-after-parse behavior
             gc.collect()
-        accepted = sum(1 for v in verdicts if v["verdict"] in ("accepted", "needs_review"))
+        accepted = sum(1 for v in verdicts if v["verdict"] == "accepted")
         all_pipelines = sorted({p for v in verdicts for p in v.get("pipeline", "").split(";") if p})
         return {"dataset_id": dsid, "content_verified": accepted > 0,
-                "n_tables_checked": sum(1 for v in verdicts if "download_failed" not in v["verdict"] and "skipped" not in v["verdict"]),
+                "n_tables_checked": sum(1 for v in verdicts if "download_failed" not in v["verdict"] and "skipped" not in v["verdict"] and v["verdict"] != "parse_warnings"),
                 "n_tables_accepted": accepted, "n_rows_written": n_rows_written,
                 "data_category": "processed" if accepted > 0 else "unknown",
                 "pipeline_source": ";".join(all_pipelines),
                 "note": json.dumps(verdicts)[:2000]}
     finally:
-        if study_dir.exists():
+        if raw_store is None and study_dir.exists():
             shutil.rmtree(study_dir, ignore_errors=True)
         gc.collect()
 
@@ -603,6 +837,12 @@ def main() -> None:
     ap.add_argument("--statuses", default="abundance_ready,needs_content_check")
     ap.add_argument("--max-file-mb", type=float, default=200)
     ap.add_argument("--max-study-mb", type=float, default=500)
+    ap.add_argument("--raw-store", default=None,
+                    help="permanent, byte-for-byte retained copy of every downloaded file, keyed by "
+                         "paper_id/dataset_id/filename. Defaults to <outdir>/raw_files. Set to the "
+                         "empty string '' to opt OUT of retention (old delete-after-parse behavior) "
+                         "-- not recommended, since it removes the only way to re-open what a verdict "
+                         "was actually based on.")
     ap.add_argument("--sleep", type=float, default=0.2,
                     help="ignored when --workers > 1 -- the shared Throttle paces requests instead")
     ap.add_argument("--workers", type=int, default=1,
@@ -622,6 +862,11 @@ def main() -> None:
     long_path = outdir / "abundance_long.tsv.gz"
     verif_path = outdir / "dataset_verification.csv"
     long_lock = threading.Lock()  # guards the shared abundance_long.tsv.gz across worker threads
+    raw_store = None if args.raw_store == "" else Path(args.raw_store or (outdir / "raw_files"))
+    raw_manifest_path = (outdir / "raw_files_manifest.csv") if raw_store is not None else None
+    raw_manifest_lock = threading.Lock()
+    needs_review_path = outdir / "needs_review_tables.csv"
+    needs_review_lock = threading.Lock()
 
     wanted = set(args.statuses.split(","))
     datasets = [r for r in csv.DictReader(open(args.datasets, newline="", encoding="utf-8"))
@@ -645,7 +890,9 @@ def main() -> None:
     if args.workers <= 1:
         for i, row in enumerate(pending, 1):
             result = verify_dataset(row, scratch, args.max_file_mb, args.max_study_mb,
-                                    long_path, matrices_dir, long_lock)
+                                    long_path, matrices_dir, long_lock,
+                                    raw_store, raw_manifest_path, raw_manifest_lock,
+                                    needs_review_path, needs_review_lock)
             w.writerow({k: result.get(k, "") for k in fieldnames})
             fh.flush()
             if i % 20 == 0:
@@ -655,12 +902,15 @@ def main() -> None:
     else:
         # Every worker downloads its OWN dataset into scratch/<dataset_id>/
         # (verify_dataset derives that subdirectory from dataset_id, so
-        # concurrent workers never share a path) and deletes it before
-        # returning -- peak scratch usage is bounded by
-        # (in-flight workers) x max-study-mb, not the whole queue.
+        # concurrent workers never share a path); raw files move to the
+        # permanent --raw-store instead of being deleted -- peak SCRATCH
+        # usage (not total disk) is still bounded by (in-flight workers) x
+        # max-study-mb, same as before.
         with ThreadPoolExecutor(args.workers) as ex:
             futs = {ex.submit(verify_dataset, row, scratch, args.max_file_mb, args.max_study_mb,
-                              long_path, matrices_dir, long_lock): row["dataset_id"]
+                              long_path, matrices_dir, long_lock,
+                              raw_store, raw_manifest_path, raw_manifest_lock,
+                              needs_review_path, needs_review_lock): row["dataset_id"]
                    for row in pending}
             for i, fu in enumerate(as_completed(futs), 1):
                 result = fu.result()
@@ -734,21 +984,33 @@ def main() -> None:
         wcsv = csv.DictWriter(f, fieldnames=pfields); wcsv.writeheader()
         wcsv.writerows([p for p in papers if p["next_action"] == "manual_content_review"])
 
-    # per-dataset matrices, built from the long table without holding it all
-    # in memory: read the tsv.gz in chunks, spool one accumulator per dataset.
+    # One matrix per (dataset_id, source_file) -- NOT merged across files
+    # within a multi-file dataset (a Zenodo/figshare deposit can bundle
+    # several unrelated tables; merging them by dataset_id alone would be
+    # exactly the undisclosed cross-file merge this whole fix exists to
+    # stop). Built from the long table without holding it all in memory:
+    # read the tsv.gz in chunks, spool one accumulator per (dataset, file).
     if long_path.exists():
         import pandas as pd
         matrices_dir.mkdir(exist_ok=True)
-        acc: dict[str, list] = defaultdict(list)
+        acc: dict[tuple[str, str], list] = defaultdict(list)
         for chunk in pd.read_csv(long_path, sep="\t", compression="gzip", chunksize=200_000):
-            for dsid, g in chunk.groupby("dataset_id"):
-                acc[dsid].append(g[["taxon", "sample_id", "value"]])
-        for dsid, parts in acc.items():
+            for (dsid, sfile), g in chunk.groupby(["dataset_id", "source_file"]):
+                acc[(dsid, sfile)].append(g[["taxon", "sample_id", "value", "is_missing", "domain",
+                                             "sample_flag", "sequencing_type_hint"]])
+        dup_reports = []
+        for (dsid, sfile), parts in acc.items():
             g = pd.concat(parts, ignore_index=True)
-            mat = g.pivot_table(index="taxon", columns="sample_id", values="value", aggfunc="sum")
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", dsid)[:120]
-            mat.to_csv(matrices_dir / f"{safe}__matrix.tsv", sep="\t")
+            mat, dup = safe_pivot(g, "taxon", "sample_id", "value")
+            safe_ds = re.sub(r"[^A-Za-z0-9._-]", "_", dsid)[:80]
+            safe_file = re.sub(r"[^A-Za-z0-9._-]", "_", sfile)[:80]
+            mat.to_csv(matrices_dir / f"{safe_ds}__{safe_file}__matrix.tsv", sep="\t")
+            if not dup.empty:
+                dup["dataset_id"], dup["source_file"] = dsid, sfile
+                dup_reports.append(dup)
             del g, mat
+        if dup_reports:
+            pd.concat(dup_reports, ignore_index=True).to_csv(outdir / "duplicate_records.tsv", sep="\t", index=False)
         gc.collect()
 
     shutil.rmtree(scratch, ignore_errors=True)

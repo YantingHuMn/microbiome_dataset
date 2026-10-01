@@ -96,7 +96,12 @@ OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 #     --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix \
 #     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
 #     --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
+#     --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
 #     --workers "${WORKERS}"
+# NOTE: --raw-store is now REQUIRED (permanent, byte-for-byte retained copy of every downloaded
+# file, with SHA256 recorded in <raw-store>/raw_files_manifest.csv) -- this is the audit trail
+# behind every row in studies.tsv/sample.tsv/table_manifest.tsv. Add --range "N" or --range "A-B"
+# here to process only a slice of the pending papers instead of the whole corpus in one submission.
 
 # combine
 python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py build \
@@ -104,4 +109,6 @@ python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py buil
     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
     --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies.tsv \
     --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample.tsv \
-    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download.tsv
+    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download.tsv \
+    --table-manifest-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/table_manifest.tsv \
+    --needs-review-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/needs_review_tables.tsv
