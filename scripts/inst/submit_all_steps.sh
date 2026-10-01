@@ -12,8 +12,7 @@
 # #SBATCH --gres=gpu:1
 # #SBATCH --array=0-3
 
-WORKERS=32
-
+WORKERS=${SLURM_CPUS_PER_TASK:-1}
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
 
 export PYTHONUNBUFFERED=1
@@ -90,25 +89,22 @@ OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 #     --workers "${WORKERS}"
 
 # download + analysize (can pause)
-# python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
-#     --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
-#     --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
-#     --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix \
-#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
-#     --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
-#     --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
-#     --workers "${WORKERS}"
-# NOTE: --raw-store is now REQUIRED (permanent, byte-for-byte retained copy of every downloaded
-# file, with SHA256 recorded in <raw-store>/raw_files_manifest.csv) -- this is the audit trail
-# behind every row in studies.tsv/sample.tsv/table_manifest.tsv. Add --range "N" or --range "A-B"
-# here to process only a slice of the pending papers instead of the whole corpus in one submission.
+python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
+    --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+    --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
+    --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix_v2 \
+    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v2.jsonl \
+    --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
+    --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
+    --workers "${WORKERS}" \
+    --range "50"
 
 # combine
 python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py build \
     --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
-    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress.jsonl \
-    --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies.tsv \
-    --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample.tsv \
-    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download.tsv \
-    --table-manifest-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/table_manifest.tsv \
-    --needs-review-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/needs_review_tables.tsv
+    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v2.jsonl \
+    --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies_v2.tsv \
+    --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample_v2.tsv \
+    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download_v2.tsv \
+    --table-manifest-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/table_manifest_v2.tsv \
+    --needs-review-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/needs_review_tables_v2.tsv
