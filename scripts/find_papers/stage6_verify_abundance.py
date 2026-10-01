@@ -455,11 +455,50 @@ def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log:
                     if hr == 0 and d.shape[1] >= 3:
                         break
         else:
+            # QIIME1/BIOM-style exports commonly prepend one or more
+            # pure-comment lines ("# Constructed from biom file") before the
+            # REAL header -- which, in the classic case, ALSO starts with
+            # "#" ("#OTU ID\t..."). A naive read infers whichever comment
+            # line sits at row 0 as the header, making every real data line
+            # look like it has too many fields under every separator -- not
+            # a parse failure, so the old per-separator try/except never
+            # caught it, and the "most columns win" logic never gets a
+            # candidate at all (every separator ties at 1 column): silently
+            # WORSE than a wrong-but-present read. Fix: find the run of
+            # leading "#"-prefixed lines; for EACH candidate separator,
+            # check whether the LAST such line itself splits into multiple
+            # fields (the classic "#OTU ID\t..." case) -- if so skip only
+            # the lines before it (it becomes the header); if not (a single
+            # plain-prose comment line with no second "#" header line),
+            # skip it too and let the first real data line's successor
+            # serve as header via pandas' normal default.
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    peek = []
+                    for _ in range(5):
+                        try:
+                            peek.append(next(fh))
+                        except StopIteration:
+                            break  # short file (<5 lines) -- keep whatever was already read
+            except (UnicodeDecodeError, OSError):
+                peek = []
+            n_leading_hash = 0
+            while n_leading_hash < len(peek) and peek[n_leading_hash].lstrip().startswith("#"):
+                n_leading_hash += 1
+
+            def _skiprows_for(sep: str) -> int:
+                if n_leading_hash == 0:
+                    return 0
+                last_hash_line = peek[n_leading_hash - 1]
+                if len([f for f in last_hash_line.split(sep) if f.strip()]) > 1:
+                    return n_leading_hash - 1  # last "#" line IS the real header -- keep it
+                return n_leading_hash          # it's plain prose -- skip it too
+
             if preview:
                 for sep in (",", "\t", ";"):
                     try:
                         d = pd.read_csv(path, sep=sep, nrows=2000, engine="python",
-                                        on_bad_lines="skip")
+                                        skiprows=_skiprows_for(sep), on_bad_lines="skip")
                     except Exception:                # noqa: BLE001
                         continue
                     if d.shape[1] > 1:
@@ -483,7 +522,8 @@ def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log:
                         return None  # drop the line from the parsed frame, but it is now recorded
 
                     try:
-                        d_try = pd.read_csv(path, sep=sep, engine="python", on_bad_lines=_record_bad_line)
+                        d_try = pd.read_csv(path, sep=sep, engine="python", skiprows=_skiprows_for(sep),
+                                            on_bad_lines=_record_bad_line)
                     except Exception:                # noqa: BLE001
                         continue
                     if d_try.shape[1] > 1:
