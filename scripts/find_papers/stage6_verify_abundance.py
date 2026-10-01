@@ -513,7 +513,22 @@ def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log:
                 # the one that actually fits the data: most columns first (the
                 # real delimiter produces the real column count), ties broken
                 # by fewest malformed lines.
-                candidates = []  # (n_cols, -n_bad, sep, df, bad_lines)
+                # Try separators ONE AT A TIME and stop at the first real
+                # success -- do NOT accumulate every candidate's full
+                # DataFrame in memory to compare afterward. That "try all
+                # three, keep all three, pick the best" approach (the
+                # previous version of this fix) reads the WHOLE file up to
+                # three times over and holds up to 3x its parsed size in
+                # memory simultaneously; confirmed as the real mechanism
+                # behind a genuine OOM on a live run (seff: State:
+                # OUT_OF_MEMORY, 512GB requested and 100% utilized) on a
+                # large real file. The skiprows-per-separator fix above
+                # already resolves which separator is "real" on its own
+                # (a wrong separator still correctly produces 1 column and
+                # gets rejected) -- no cross-separator comparison is needed
+                # once that is in place, so first-success-wins is both
+                # correct AND bounded to ~1x the file's parsed size at a
+                # time, same memory shape as the preview path.
                 for sep in (",", "\t", ";"):
                     bad_here: list[str] = []
 
@@ -522,20 +537,18 @@ def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log:
                         return None  # drop the line from the parsed frame, but it is now recorded
 
                     try:
-                        d_try = pd.read_csv(path, sep=sep, engine="python", skiprows=_skiprows_for(sep),
-                                            on_bad_lines=_record_bad_line)
+                        d = pd.read_csv(path, sep=sep, engine="python", skiprows=_skiprows_for(sep),
+                                        on_bad_lines=_record_bad_line)
                     except Exception:                # noqa: BLE001
                         continue
-                    if d_try.shape[1] > 1:
-                        candidates.append((d_try.shape[1], -len(bad_here), sep, d_try, bad_here))
-                if candidates:
-                    candidates.sort(reverse=True)
-                    _, _, best_sep, d, bad_here = candidates[0]
-                    if bad_here and bad_lines_log is not None:
-                        bad_lines_log.append(
-                            f"{path.name} [sep={best_sep!r}]: {len(bad_here)} malformed line(s) dropped: "
-                            + " | ".join(bad_here[:10]) + (" ..." if len(bad_here) > 10 else ""))
-                    yield path.name, 0, d
+                    if d.shape[1] > 1:
+                        if bad_here and bad_lines_log is not None:
+                            bad_lines_log.append(
+                                f"{path.name} [sep={sep!r}]: {len(bad_here)} malformed line(s) dropped: "
+                                + " | ".join(bad_here[:10]) + (" ..." if len(bad_here) > 10 else ""))
+                        yield path.name, 0, d
+                        break
+                    del d
     except Exception as e:                           # noqa: BLE001
         print(f"    iter_tables error on {path.name}: {e}", file=sys.stderr)
 
