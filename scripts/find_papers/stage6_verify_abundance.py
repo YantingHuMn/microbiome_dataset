@@ -133,14 +133,36 @@ REVIEW_TAXA_FRACTION = 0.30
 # match (rank-prefixed Bacteria/Archaea or a recognized bacterial/archaeal
 # clade keyword), and anything matching neither is "unknown" -- the
 # original taxon string is always preserved regardless of the domain call.
+# NOTE: \b (word boundary) treats "_" as a word character, so it does NOT
+# separate a bare rank-prefixed kingdom value from its prefix --
+# "d__Bacteria" has NO boundary between "_" and "B" ('_' and 'B' are both
+# \w), so \bbacteria\b previously failed to match the single most common
+# taxonomy-string convention in this whole pipeline (QIIME2/SILVA/GTDB-style
+# "d__Bacteria;..." / "k__Bacteria;..."), and similarly "bacter\b",
+# "bacteroides\b" etc. failed on underscore-joined names like
+# "Bacteroides_fragilis". Confirmed as a real, wide-reaching bug: real
+# phyla/genera such as "d__Bacteria;p__Chloroflexi",
+# "d__Archaea;p__Halobacterota", and "Bacteroides_fragilis" were ALL being
+# classified as domain="unknown" instead of "prokaryote". Fixed by using
+# (?<![A-Za-z])...(?![A-Za-z]) instead of \b -- this still rejects a match
+# embedded in a longer alphabetic word (e.g. "Patescibacteria" does not
+# spuriously match the bare "bacteria" alternative) while correctly
+# matching when the adjacent character is "_", a digit, ";", or start/end
+# of string.
 VIRUS_RE = re.compile(r"(?:virus|viridae|virales|phage)", re.I)
 PROKARYOTE_RE = re.compile(
-    r"(?:\bbacteria\b|\barchaea\b|bacteriota|proteobacteria|firmicutes|"
+    r"(?:(?<![A-Za-z])bacteria(?![A-Za-z])|(?<![A-Za-z])archaea(?![A-Za-z])|"
+    r"bacteriota|proteobacteria|firmicutes|"
     r"bacteroidetes|bacteroidota|actinobacteri|cyanobacteria|verrucomicrobi|"
     r"spirochaet|chlamydiae|tenericutes|fusobacteri|euryarchaeota|"
-    r"crenarchaeota|thaumarchaeota|coccus\b|bacillus\b|monas\b|bacter\b|"
-    r"vibrio\b|spirillum\b|clostridium\b|prevotella\b|bacteroides\b|"
-    r"lactobacillus\b|bifidobacterium\b|akkermansia\b|faecalibacterium\b)",
+    r"crenarchaeota|thaumarchaeota|"
+    r"(?<![A-Za-z])coccus(?![A-Za-z])|(?<![A-Za-z])bacillus(?![A-Za-z])|"
+    r"(?<![A-Za-z])monas(?![A-Za-z])|(?<![A-Za-z])bacter(?![A-Za-z])|"
+    r"(?<![A-Za-z])vibrio(?![A-Za-z])|(?<![A-Za-z])spirillum(?![A-Za-z])|"
+    r"(?<![A-Za-z])clostridium(?![A-Za-z])|(?<![A-Za-z])prevotella(?![A-Za-z])|"
+    r"(?<![A-Za-z])bacteroides(?![A-Za-z])|(?<![A-Za-z])lactobacillus(?![A-Za-z])|"
+    r"(?<![A-Za-z])bifidobacterium(?![A-Za-z])|(?<![A-Za-z])akkermansia(?![A-Za-z])|"
+    r"(?<![A-Za-z])faecalibacterium(?![A-Za-z]))",
     re.I)
 
 # Sample-ID patterns that must be FLAGGED, never silently dropped or merged,
