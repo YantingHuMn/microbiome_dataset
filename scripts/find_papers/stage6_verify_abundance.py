@@ -741,6 +741,35 @@ def to_long_rows(d, verdict: dict, paper_id: str, dataset_id: str, source_file: 
             idx = d.columns[0]
             num = d.drop(columns=[idx]).apply(pd.to_numeric, errors="coerce")
             num = num.loc[:, num.notna().mean() > 0.5]
+            # Pandas appends ".1", ".2", ... to disambiguate a column name
+            # that is EXACTLY repeated in the raw file -- a real, confirmed
+            # author copy-paste error (e.g. the same taxonomy string column
+            # pasted twice in a deposited spreadsheet). Left un-normalized,
+            # the ".1" gets folded into the taxon string and then into the
+            # LAST rank token by split_taxonomy()'s greedy (.*) capture
+            # whenever that token is non-empty (e.g. "c__Dojkabacteria.1"
+            # parses to class="Dojkabacteria.1"), producing a DIFFERENT,
+            # FICTITIOUS taxon label ("prok_Dojkabacteria_1") instead of
+            # being recognized as a duplicate of "prok_Dojkabacteria" --
+            # confirmed on real data: this silently created 3 fictitious
+            # extra taxon columns (Dojkabacteria_1, DG_56_1, Lineage_IIa_1)
+            # that were never flagged in dup_report, while a 4th genuine
+            # duplicate (Myxococcota) only happened to collide correctly
+            # because its rank value was empty and the suffix landed on
+            # the discarded placeholder instead. Only strip the suffix
+            # when the un-suffixed name is ALSO present among the real
+            # columns (i.e. it is provably a pandas-dedup artifact, not a
+            # legitimate taxon name that happens to end in ".3").
+            orig_names = set(str(c) for c in d.columns)
+
+            def _undedupe(c):
+                c = str(c)
+                m = re.match(r"^(.*)\.(\d+)$", c)
+                if m and m.group(1) in orig_names:
+                    return m.group(1)
+                return c
+
+            num.columns = [_undedupe(c) for c in num.columns]
             out = num.copy()
             out.insert(0, "sample_id", d[idx].astype(str).values)
             out = out.melt(id_vars="sample_id", var_name="taxon", value_name="value")
