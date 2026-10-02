@@ -49,7 +49,7 @@ from stage6_verify_abundance import (          # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from stage7_extract_abundance_matrix import (         # noqa: E402
-    build_table_matrix, fetch_first_author_year, assign_study_id, MatrixTooLargeError,
+    build_table_matrix, build_taxonomy_table, fetch_first_author_year, assign_study_id, MatrixTooLargeError,
 )
 
 
@@ -135,10 +135,14 @@ def main() -> None:
         safe_name = __import__("re").sub(r"[^A-Za-z0-9._-]", "_", f"{args.dataset_id}__{source_file}")[:150]
         matrix_path = data_dir / f"{safe_name}.matrix.tsv"
         long_path = data_dir / f"{safe_name}.long.tsv.gz"
+        taxonomy_path = data_dir / f"{safe_name}.taxonomy.tsv"
         wide.to_csv(matrix_path, sep="\t", index=False)
         rows.to_csv(long_path, sep="\t", index=False, compression="gzip")
         if not dup.empty:
             dup.to_csv(data_dir / f"{safe_name}.duplicates.tsv", sep="\t", index=False)
+        taxonomy = build_taxonomy_table(rows)
+        if not taxonomy.empty:
+            taxonomy.to_csv(taxonomy_path, sep="\t", index=False)
         blank_ids = sorted(rows.loc[rows["sample_flag"] == "blank_or_control", "sample_id"].unique().tolist())
         seq_hints = sorted({h for h in rows["sequencing_type_hint"] if h})
         new_tables.append({

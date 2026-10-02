@@ -9,10 +9,18 @@ final_status == "abundance_ready" papers (per user decision -- not
 needs_content_check; that subset is stage6's job if/when it's run).
 
 Outputs, in the exact schema the user's own Google Sheet template uses:
-  - one wide matrix per study: <data_dir>/<study_id>_abundance_matrix.tsv
-        sample_id, source, then one column per taxon, prefixed
-        virus_/prok_ per stage6's domain classification. `source` is the
-        dataset_id (repo:accession) the row's values came from.
+  - one wide matrix per (dataset, source file, sub-table): <data_dir>/
+        <study_id>/<safe_name>.matrix.tsv -- sample_id, source, then one
+        column per taxon, using the BARE original name (no domain
+        prefix -- see build_table_matrix/build_taxonomy_table). `source`
+        is the dataset_id (repo:accession) the row's values came from.
+  - a sibling <safe_name>.taxonomy.tsv for every matrix: one row per
+        column, recording what that column name actually means -- the
+        full raw taxon string as deposited, the per-rank breakdown, the
+        domain call, and its evidence. This is the reference for "what is
+        this column", kept separate from the matrix header on purpose: a
+        wrong classification no longer means renaming a column
+        invalidates anything already keyed off its name.
   - studies.tsv   (appended, matching the user's studies.tsv template columns)
   - sample.tsv    (appended, matching the user's sample.tsv template columns --
                    only fields resolvable from what stage3/4/6 already carry
@@ -189,15 +197,74 @@ class MatrixTooLargeError(Exception):
     processing."""
 
 
+def taxon_label_for(row, rank_cols=("genus", "family", "order", "class", "phylum", "kingdom")):
+    """The single most-specific available rank value for this row (genus_
+    species when both are known, else the deepest non-empty rank), or the
+    raw taxon string as a last resort. Shared by build_table_matrix and
+    build_taxonomy_table so the matrix column name and the taxonomy
+    sidecar's col_name always agree."""
+    genus, species = row.get("genus", ""), row.get("species", "")
+    if genus and species:
+        return f"{genus}_{species}"  # avoid collisions: two genera can share a species epithet
+    for r in rank_cols:
+        v = row.get(r, "")
+        if v:
+            return v
+    return row.get("taxon", "unknown")
+
+
+def build_taxonomy_table(table_df):
+    """One row per DISTINCT col_name in this table (the same col_name that
+    ends up as a matrix column header), recording what that name actually
+    MEANS -- the full raw taxon string as the source deposited it, the
+    per-rank breakdown split_taxonomy() already parsed out of it, and the
+    domain call + its evidence. This is the reference a user consults to
+    answer "what is this column", NOT the matrix header itself -- the
+    header is deliberately left as the bare original name (see
+    build_table_matrix), so this file is the only place the domain
+    classification and its evidence are recorded at all.
+
+    lineage_source is 'explicit_in_source' when the raw taxon string
+    itself yielded at least one non-empty rank (i.e. it used a recognized
+    rank-prefix convention like d__/p__/c__ or an unprefixed positional
+    lineage) -- in that case the source already told us the lineage and
+    no external reference lookup is needed. It is
+    'no_lineage_info_in_source' when NONE of the ranks could be parsed
+    (e.g. a bare OTU/ASV id with no attached taxonomy string at all) --
+    these are the only rows where cross-checking an external authority
+    (e.g. SILVA) would add information the source itself doesn't give.
+    """
+    import pandas as pd
+    if table_df.empty:
+        return pd.DataFrame()
+    df = table_df.copy()
+    df["col_name"] = df.apply(taxon_label_for, axis=1).astype(str).str.replace(r"[^\w]+", "_", regex=True)
+    rank_fields = ["kingdom", "phylum", "class", "order", "family", "genus", "species"]
+    for r in rank_fields:
+        if r not in df.columns:
+            df[r] = ""
+    df["lineage_source"] = df[rank_fields].apply(
+        lambda r: "explicit_in_source" if any(str(v).strip() for v in r) else "no_lineage_info_in_source",
+        axis=1)
+    cols = ["col_name", "taxon"] + rank_fields + ["domain", "domain_evidence", "lineage_source"]
+    tax = df[cols].drop_duplicates(subset=["col_name", "taxon"]).rename(columns={"taxon": "raw_taxon_string"})
+    return tax.sort_values(["lineage_source", "col_name"]).reset_index(drop=True)
+
+
 def build_table_matrix(table_df, max_cells: int = 20_000_000):
     """table_df: to_long_rows() output for ONE (dataset_id, source_file,
     sub_table) -- NEVER multiple tables concatenated together; this
     function does not merge anything across files, sheets, or sequencing
     types. Returns (wide_df, dup_report):
       wide_df: sample_id, source, then one column per taxon (genus_species
-        where both are known, else the most specific available rank,
-        prefixed virus_/prok_/unk_ by domain). A (sample, taxon) cell with
-        NO underlying row is left BLANK (NaN), never silently zero-filled.
+        where both are known, else the most specific available rank) --
+        the BARE original name, with no virus_/prok_/unk_ domain prefix.
+        What a column actually is (full lineage, domain call + evidence)
+        lives in the sibling *.taxonomy.tsv from build_taxonomy_table(),
+        not baked into the header -- a wrong classification no longer
+        means renaming a column retroactively invalidates anything that
+        already keyed off its name. A (sample, taxon) cell with NO
+        underlying row is left BLANK (NaN), never silently zero-filled.
       dup_report: rows where the SAME (sample, taxon) pair had more than
         one raw value within this one table -- these are surfaced, not
         summed; the corresponding wide_df cell is left blank pending
@@ -209,21 +276,8 @@ def build_table_matrix(table_df, max_cells: int = 20_000_000):
     if table_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     df = table_df.copy()
-    rank_cols = ["genus", "family", "order", "class", "phylum", "kingdom"]
-
-    def taxon_label(row):
-        genus, species = row.get("genus", ""), row.get("species", "")
-        if genus and species:
-            return f"{genus}_{species}"  # avoid collisions: two genera can share a species epithet
-        for r in rank_cols:
-            v = row.get(r, "")
-            if v:
-                return v
-        return row.get("taxon", "unknown")
-
-    df["taxon_label"] = df.apply(taxon_label, axis=1)
-    prefix = df["domain"].map({"virus": "virus_", "prokaryote": "prok_"}).fillna("unk_")
-    df["col_name"] = prefix + df["taxon_label"].astype(str).str.replace(r"[^\w]+", "_", regex=True)
+    df["taxon_label"] = df.apply(taxon_label_for, axis=1)
+    df["col_name"] = df["taxon_label"].astype(str).str.replace(r"[^\w]+", "_", regex=True)
 
     n_samples = df["sample_id"].nunique()
     n_cols = df["col_name"].nunique()
@@ -355,10 +409,14 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                         safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{dsid}__{source_file}")[:150]
                         matrix_path = study_out_dir / f"{safe_name}.matrix.tsv"
                         long_path = study_out_dir / f"{safe_name}.long.tsv.gz"
+                        taxonomy_path = study_out_dir / f"{safe_name}.taxonomy.tsv"
                         wide.to_csv(matrix_path, sep="\t", index=False)
                         rows.to_csv(long_path, sep="\t", index=False, compression="gzip")
                         if not dup.empty:
                             dup.to_csv(study_out_dir / f"{safe_name}.duplicates.tsv", sep="\t", index=False)
+                        taxonomy = build_taxonomy_table(rows)
+                        if not taxonomy.empty:
+                            taxonomy.to_csv(taxonomy_path, sep="\t", index=False)
 
                         blank_ids = sorted(rows.loc[rows["sample_flag"] == "blank_or_control", "sample_id"].unique().tolist())
                         seq_hints = sorted({h for h in rows["sequencing_type_hint"] if h})
