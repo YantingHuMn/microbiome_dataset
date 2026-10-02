@@ -709,7 +709,19 @@ def split_taxonomy(label: str) -> dict[str, str]:
                 out[rank] = m.group(2).strip()
         elif part:
             unprefixed.append(part)
-    if unprefixed and not any(out.values()):
+    # Only apply positional rank-mapping when there are >= 2 unprefixed
+    # tokens -- i.e. a genuine semicolon-joined lineage that simply omits
+    # rank-prefix letters (e.g. "Bacteria;Firmicutes;Clostridia"). A
+    # SINGLE bare token (no semicolons at all, e.g. a bare OTU/ASV id like
+    # "OTU_412", or even a bare phylum name like "Firmicutes" with no
+    # lineage context) carries no information about which rank it is --
+    # positionally forcing it into RANKS[0]="kingdom" was a real bug
+    # (confirmed: "OTU_412" was being recorded as kingdom="OTU_412",
+    # wrongly reported as if the source gave an explicit lineage). Domain
+    # classification is unaffected either way since classify_domain()
+    # matches directly against the raw taxon string, independent of this
+    # per-rank breakdown.
+    if len(unprefixed) >= 2 and not any(out.values()):
         for rank, val in zip(RANKS, unprefixed):
             out[rank] = val
     return out
