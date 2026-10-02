@@ -580,8 +580,39 @@ def sniff_frame(d) -> dict:
     if len(num_cols) < 3:
         v["reason"] = f"only {len(num_cols)} numeric columns"
         return v
+    # Candidate row-label columns must NOT look like file paths/URLs --
+    # otherwise a metadata column such as "forward-absolute-filepath"
+    # (raw FASTQ paths, e.g. ".../Bacteria_CL860-001M0004_good_1.fq.gz")
+    # can score a false-positive taxa_fraction near 1.0, because TAXA_RE's
+    # bare "bacteria"/"archaea"/etc. alternatives match ANYWHERE in a long
+    # unrelated string with no requirement that the string itself IS a
+    # taxon label. Confirmed as a real bug on a live run: this exact
+    # column beat the true column-header taxonomic signal (~0.98) and
+    # flipped axis detection to "rows" with label_col="forward-absolute-
+    # filepath", causing to_long_rows to treat raw file paths as "taxon"
+    # and the real taxon column headers as "sample_id" -- i.e. every
+    # value ended up transposed and mislabeled, not merely wrong.
+    # A real taxon label can legitimately contain a single "/" (e.g. the
+    # "Escherichia/Shigella" ambiguous-genus notation some callers use) --
+    # a SINGLE slash is not enough signal on its own. Require either a
+    # recognized raw-sequencing-file extension (near-zero false-positive
+    # risk) or at least TWO slashes (real directory structure, e.g.
+    # "/mnt/d/Von/.../file.fq.gz", vs. one stylistic separator in a label).
+    SEQFILE_EXT_RE = re.compile(r"\.(?:fastq|fq|bam|sam|sra)(?:\.gz)?$", re.I)
+    MULTI_SLASH_RE = re.compile(r"[/\\].*[/\\]")
+
+    def _looks_pathlike(col) -> bool:
+        vals = d[col].dropna().astype(str).head(50)
+        if vals.empty:
+            return False
+        frac_seqfile = vals.str.contains(SEQFILE_EXT_RE).mean()
+        frac_multi_slash = vals.str.contains(MULTI_SLASH_RE).mean()
+        return frac_seqfile > 0.5 or frac_multi_slash > 0.5
+
     row_best, row_col = 0.0, None
     for c in lab_cols[:3]:
+        if _looks_pathlike(c):
+            continue
         f = taxa_fraction(d[c].dropna().astype(str).head(300))
         if f > row_best:
             row_best, row_col = f, c
