@@ -69,6 +69,7 @@ sys.path.insert(0, str((Path(__file__).resolve().parent.parent / "find_papers"))
 from stage6_verify_abundance import (          # noqa: E402
     list_deposit_files, stream_download, iter_tables, sniff_frame,
     to_long_rows, check_dependencies, retain_raw_file, append_raw_manifest, safe_pivot,
+    detect_taxonomy_lookup_table, build_id_to_lineage_map, split_taxonomy, classify_domain,
 )
 from _netutil import GLOBAL_THROTTLE           # noqa: E402
 
@@ -214,26 +215,36 @@ def col_name_for(taxon_string) -> str:
     return re.sub(r"[^\w]+", "_", str(taxon_string).strip())
 
 
-def build_taxonomy_table(table_df):
+def build_taxonomy_table(table_df, lineage_lookup: dict | None = None):
     """One row per DISTINCT col_name in this table (the same col_name that
     ends up as a matrix column header), recording what that name actually
     MEANS -- the full raw taxon string as the source deposited it, the
-    per-rank breakdown split_taxonomy() already parsed out of it, and the
-    domain call + its evidence. This is the reference a user consults to
+    per-rank breakdown, the domain call + its evidence, and WHERE that
+    information came from. This is the reference a user consults to
     answer "what is this column", NOT the matrix header itself -- the
     header is deliberately left as the bare original name (see
     build_table_matrix), so this file is the only place the domain
     classification and its evidence are recorded at all.
 
-    lineage_source is 'explicit_in_source' when the raw taxon string
-    itself yielded at least one non-empty rank (i.e. it used a recognized
-    rank-prefix convention like d__/p__/c__ or an unprefixed positional
-    lineage) -- in that case the source already told us the lineage and
-    no external reference lookup is needed. It is
-    'no_lineage_info_in_source' when NONE of the ranks could be parsed
-    (e.g. a bare OTU/ASV id with no attached taxonomy string at all) --
-    these are the only rows where cross-checking an external authority
-    (e.g. SILVA) would add information the source itself doesn't give.
+    lineage_source, in descending order of confidence:
+      - 'from_paper_sibling_taxonomy_file': the bare id (e.g. "denovo0")
+        was found in a separate author-provided ID->taxonomy lookup file
+        from the SAME deposit (see detect_taxonomy_lookup_table /
+        build_id_to_lineage_map in stage6, passed in here as
+        lineage_lookup). This is the author's own assignment for these
+        exact sequences -- the most authoritative source there is, more
+        confident than either our own keyword-based guess or a generic
+        external reference lookup. lineage_source_file records which
+        file it came from.
+      - 'explicit_in_source': the raw taxon string IN THIS TABLE ITSELF
+        already used a recognized rank-prefix convention (d__/p__/c__ or
+        an unprefixed multi-token lineage) -- also from the paper, just
+        already embedded in the same table rather than a sibling file.
+      - 'no_lineage_info_in_source': neither of the above gave anything
+        (e.g. a bare OTU/ASV id with no sibling lookup file found) --
+        the ONLY case where consulting an external authority (e.g. SILVA)
+        would add information neither the table nor its deposit siblings
+        already give directly.
     """
     import pandas as pd
     if table_df.empty:
@@ -247,7 +258,29 @@ def build_taxonomy_table(table_df):
     df["lineage_source"] = df[rank_fields].apply(
         lambda r: "explicit_in_source" if any(str(v).strip() for v in r) else "no_lineage_info_in_source",
         axis=1)
-    cols = ["col_name", "taxon"] + rank_fields + ["domain", "domain_evidence", "lineage_source"]
+    df["lineage_source_file"] = ""
+
+    if lineage_lookup:
+        # A sibling lookup file takes priority REGARDLESS of whether this
+        # table's own string already looked explicit -- the sibling file
+        # is the authors' direct assignment and may carry more/different
+        # detail than whatever (if anything) this table's own label gave.
+        for idx, taxon in df["taxon"].items():
+            hit = lineage_lookup.get(str(taxon).strip())
+            if not hit:
+                continue
+            lineage_string, source_file = hit
+            ranks = split_taxonomy(lineage_string)
+            for r in rank_fields:
+                df.at[idx, r] = ranks.get(r, "")
+            domain, evidence = classify_domain(lineage_string)
+            df.at[idx, "domain"] = domain
+            df.at[idx, "domain_evidence"] = evidence
+            df.at[idx, "lineage_source"] = "from_paper_sibling_taxonomy_file"
+            df.at[idx, "lineage_source_file"] = source_file
+
+    cols = ["col_name", "taxon"] + rank_fields + ["domain", "domain_evidence",
+                                                    "lineage_source", "lineage_source_file"]
     tax = df[cols].drop_duplicates(subset=["col_name", "taxon"]).rename(columns={"taxon": "raw_taxon_string"})
     return tax.sort_values(["lineage_source", "col_name"]).reset_index(drop=True)
 
@@ -351,6 +384,20 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
         except Exception as e:                      # noqa: BLE001
             blocked_files.append((dsid, "<listing>", f"list_deposit_files error: {e}"))
             continue
+
+        # --- Pass 0: download + retain EVERY file in this dataset first,
+        # and scan each for an author-provided ID->taxonomy lookup table
+        # (e.g. a split deposit like Goodall_2026's otutab_251210.csv +
+        # taxa_251210.csv). This has to happen BEFORE processing any
+        # abundance table in pass 1, because a bare-id table may need the
+        # lookup from a file that iter_tables would otherwise visit later
+        # (or never, if that file alone doesn't look like abundance data).
+        # Memory discipline: this builds one dict of (small) id->lineage
+        # strings across the dataset, not the tables themselves -- the
+        # actual table content is still read/discarded one file at a time
+        # in both passes, never held in memory across the whole dataset.
+        local_files = []  # [(name, local_path)]
+        lineage_lookup: dict = {}  # id -> (lineage_string, source_filename)
         for name, url, _size in files:
             if not url:
                 continue
@@ -365,10 +412,24 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
             manifest_row = retain_raw_file(local, raw_store, paper_id, dsid, repo, acc, url, name)
             append_raw_manifest(raw_manifest_path, manifest_row, raw_manifest_lock)
             local = Path(manifest_row["retained_path"])
-
             if looks_like_challenge_page(local):
                 blocked_files.append((dsid, name, "anti_bot_challenge_page"))
                 continue
+            local_files.append((name, local))
+            try:
+                for sub_id, _hr, d in iter_tables(local, preview=False):
+                    lut = detect_taxonomy_lookup_table(d)
+                    if not lut:
+                        continue
+                    for tid, lineage in build_id_to_lineage_map(d, lut).items():
+                        lineage_lookup.setdefault(tid, (lineage, f"{name}!{sub_id}"))
+            except Exception:                        # noqa: BLE001
+                pass  # best-effort detection only; real read errors resurface in pass 1
+        known_ids = frozenset(lineage_lookup) if lineage_lookup else None
+
+        # --- Pass 1: process each file's actual abundance tables, now
+        # with known_ids/lineage_lookup available for bare-id tables.
+        for name, local in local_files:
             # iter_tables (stage6, shared code) SWALLOWS its own top-level
             # exceptions internally (prints to stderr, yields nothing) --
             # capture that stderr so a nested-member failure (corrupt zip
@@ -381,7 +442,7 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
             try:
                 with contextlib.redirect_stderr(stderr_buf):
                     for sub_id, _hr, d in iter_tables(local, preview=False, bad_lines_log=bad_lines_log):
-                        v = sniff_frame(d)
+                        v = sniff_frame(d, known_taxon_ids=known_ids)
                         if not v["is_abundance"]:
                             continue
                         source_file = f"{name}!{sub_id}"
@@ -420,7 +481,7 @@ def process_paper(paper: dict, datasets: list[dict], scratch: Path,
                         rows.to_csv(long_path, sep="\t", index=False, compression="gzip")
                         if not dup.empty:
                             dup.to_csv(study_out_dir / f"{safe_name}.duplicates.tsv", sep="\t", index=False)
-                        taxonomy = build_taxonomy_table(rows)
+                        taxonomy = build_taxonomy_table(rows, lineage_lookup=lineage_lookup)
                         if not taxonomy.empty:
                             taxonomy.to_csv(taxonomy_path, sep="\t", index=False)
 

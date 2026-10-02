@@ -575,7 +575,16 @@ def iter_tables(path: Path, depth: int = 0, preview: bool = True, bad_lines_log:
         print(f"    iter_tables error on {path.name}: {e}", file=sys.stderr)
 
 
-def sniff_frame(d) -> dict:
+def sniff_frame(d, known_taxon_ids=None) -> dict:
+    """known_taxon_ids: optional set of ids (strings) known, from a sibling
+    ID->taxonomy lookup file in the SAME deposit, to carry a real lineage
+    (see detect_taxonomy_lookup_table/build_id_to_lineage_map). A bare
+    opaque id like "denovo0" or "OTU_412" has zero textual taxonomic
+    signal on its own -- without this, such a table is correctly rejected
+    as "no taxonomic signal". When the caller has independently confirmed
+    (via a sibling file) that these exact ids DO have real author-assigned
+    taxonomy, that is authoritative evidence this is a real abundance
+    table, even though nothing about the ids themselves looks taxonomic."""
     import numpy as np
     import pandas as pd
     v = {"is_abundance": False, "kind": "none", "axis": "", "label_col": None,
@@ -643,7 +652,26 @@ def sniff_frame(d) -> dict:
         axis, frac, label = "rows", row_best, row_col
     else:
         axis, frac, label = "cols", col_best, None
-    v.update(axis=axis, score=float(frac), label_col=(str(label) if label is not None else None))
+
+    id_matched_lineage = False
+    if frac < MIN_TAXA_FRACTION and known_taxon_ids:
+        id_row_best, id_row_col = 0.0, None
+        for c in lab_cols[:3]:
+            if _looks_pathlike(c):
+                continue
+            vals = d[c].dropna().astype(str).str.strip().head(300)
+            if len(vals):
+                f2 = vals.isin(known_taxon_ids).mean()
+                if f2 > id_row_best:
+                    id_row_best, id_row_col = f2, c
+        id_col_best = pd.Series(cols).isin(known_taxon_ids).mean() if cols else 0.0
+        if id_row_best >= id_col_best and id_row_best > frac:
+            axis, frac, label, id_matched_lineage = "rows", id_row_best, id_row_col, True
+        elif id_col_best > frac:
+            axis, frac, label, id_matched_lineage = "cols", id_col_best, None, True
+
+    v.update(axis=axis, score=float(frac), label_col=(str(label) if label is not None else None),
+             id_matched_lineage=id_matched_lineage)
 
     arr = numeric[num_cols].to_numpy(dtype=float, na_value=np.nan)
     finite = arr[np.isfinite(arr)]
@@ -657,11 +685,12 @@ def sniff_frame(d) -> dict:
         elif np.allclose(finite, np.round(finite)) and finite.max() > 10:
             v["value_type"] = "count"
 
+    id_note = " (ids matched against sibling taxonomy lookup file)" if id_matched_lineage else ""
     if frac >= MIN_TAXA_FRACTION:
-        v.update(is_abundance=True, kind="wide", reason=f"{frac:.0%} of {axis} look taxonomic")
+        v.update(is_abundance=True, kind="wide", reason=f"{frac:.0%} of {axis} look taxonomic{id_note}")
     elif frac >= REVIEW_TAXA_FRACTION:
         v.update(is_abundance=True, kind="wide", needs_review=True,
-                 reason=f"weak taxonomic signal ({frac:.0%})")
+                 reason=f"weak taxonomic signal ({frac:.0%}){id_note}")
     else:
         v["reason"] = f"no taxonomic signal ({frac:.0%})"
     return v
@@ -694,6 +723,65 @@ def safe_pivot(g, index_col: str, columns_col: str, values_col: str):
 
     piv = g.pivot_table(index=index_col, columns=columns_col, values=values_col, aggfunc=_collapse)
     return piv, dup_report
+
+
+def detect_taxonomy_lookup_table(d) -> dict | None:
+    """Detect whether this table is an author-provided ID -> taxonomy
+    MAPPING (e.g. QIIME2's taxonomy.tsv, or a split-deposit's standalone
+    taxonomy file like Goodall_2026's taxa_251210.csv paired with
+    otutab_251210.csv) rather than a numeric abundance table. These are
+    the MOST authoritative source for what a bare OTU/ASV id means --
+    more confident than guessing from the id itself or consulting a
+    generic external reference, because it's the authors' own assignment
+    for these exact sequences. Returns {"id_col", "lineage_cols", "mode"}
+    ("single_col": one column already holds full semicolon-joined
+    lineages; "multi_col": separate columns hold one rank each, e.g.
+    taxonomy_1..taxonomy_7) or None if this doesn't look like a lookup
+    table at all (sniff_frame's own abundance check already rejects these
+    as non-numeric, so this is a SEPARATE classification, not a competing
+    one)."""
+    import pandas as pd
+    if d.shape[1] < 2 or d.shape[0] < 1:
+        return None
+    cols = list(d.columns)
+    id_col = cols[0]
+    other_cols = cols[1:]
+    if not other_cols:
+        return None
+    numeric_frac = d[other_cols].apply(pd.to_numeric, errors="coerce").notna().mean().mean()
+    if numeric_frac > 0.2:
+        return None  # overwhelmingly numeric -- this is an abundance table, not a lookup
+    for c in other_cols:
+        vals = d[c].dropna().astype(str).head(200)
+        if len(vals) and vals.str.contains(";").mean() > 0.3 and vals.map(lambda s: bool(TAXA_RE.search(s))).mean() > 0.5:
+            return {"id_col": id_col, "lineage_cols": [c], "mode": "single_col"}
+    rank_prefix_re = re.compile(r"^[kpcofgsd](_[a-z])?__", re.I)
+    good_cols = []
+    for c in other_cols:
+        vals = d[c].dropna().astype(str).head(200)
+        if len(vals) and vals.map(lambda s: bool(rank_prefix_re.match(s.strip()))).mean() > 0.3:
+            good_cols.append(c)
+    if len(good_cols) >= 2:
+        return {"id_col": id_col, "lineage_cols": good_cols, "mode": "multi_col"}
+    return None
+
+
+def build_id_to_lineage_map(d, verdict: dict) -> dict:
+    """{str(id): lineage_string} from a table detect_taxonomy_lookup_table
+    classified as a lookup. 'multi_col' mode (separate rank columns, e.g.
+    taxonomy_1..taxonomy_7) is joined with ';' into one parseable string,
+    same shape split_taxonomy() already expects from a single column."""
+    import pandas as pd
+    id_col, lineage_cols = verdict["id_col"], verdict["lineage_cols"]
+    out = {}
+    for _, row in d[[id_col] + lineage_cols].iterrows():
+        rid = str(row[id_col]).strip()
+        if not rid or rid.lower() == "nan":
+            continue
+        vals = [str(row[c]).strip() for c in lineage_cols if pd.notna(row[c]) and str(row[c]).strip()]
+        if vals:
+            out[rid] = ";".join(vals)
+    return out
 
 
 def split_taxonomy(label: str) -> dict[str, str]:
