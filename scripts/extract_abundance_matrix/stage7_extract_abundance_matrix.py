@@ -197,20 +197,21 @@ class MatrixTooLargeError(Exception):
     processing."""
 
 
-def taxon_label_for(row, rank_cols=("genus", "family", "order", "class", "phylum", "kingdom")):
-    """The single most-specific available rank value for this row (genus_
-    species when both are known, else the deepest non-empty rank), or the
-    raw taxon string as a last resort. Shared by build_table_matrix and
-    build_taxonomy_table so the matrix column name and the taxonomy
-    sidecar's col_name always agree."""
-    genus, species = row.get("genus", ""), row.get("species", "")
-    if genus and species:
-        return f"{genus}_{species}"  # avoid collisions: two genera can share a species epithet
-    for r in rank_cols:
-        v = row.get(r, "")
-        if v:
-            return v
-    return row.get("taxon", "unknown")
+def col_name_for(taxon_string) -> str:
+    """Sanitize (filesystem/TSV-safe characters only) the RAW taxon string
+    exactly as the source deposited it -- e.g. "d__Bacteria;p__
+    Cloacimonadota" stays "d__Bacteria;p__Cloacimonadota" (semicolons ->
+    underscores), it is never shortened to just "Cloacimonadota" or any
+    other derived label. If a user wants to know what a column means, the
+    sibling *.taxonomy.tsv (build_taxonomy_table) is where that lookup
+    happens -- the matrix header itself is never "cleaned up" on their
+    behalf. Shared by build_table_matrix and build_taxonomy_table so the
+    matrix column name and the taxonomy sidecar's col_name always agree
+    (a genuine source duplicate -- identical raw string after to_long_rows'
+    pandas-dedup-suffix normalization -- still collapses to one col_name
+    and is still caught by safe_pivot's dup_report, same as before)."""
+    import re
+    return re.sub(r"[^\w]+", "_", str(taxon_string).strip())
 
 
 def build_taxonomy_table(table_df):
@@ -238,7 +239,7 @@ def build_taxonomy_table(table_df):
     if table_df.empty:
         return pd.DataFrame()
     df = table_df.copy()
-    df["col_name"] = df.apply(taxon_label_for, axis=1).astype(str).str.replace(r"[^\w]+", "_", regex=True)
+    df["col_name"] = df["taxon"].map(col_name_for)
     rank_fields = ["kingdom", "phylum", "class", "order", "family", "genus", "species"]
     for r in rank_fields:
         if r not in df.columns:
@@ -256,15 +257,21 @@ def build_table_matrix(table_df, max_cells: int = 20_000_000):
     sub_table) -- NEVER multiple tables concatenated together; this
     function does not merge anything across files, sheets, or sequencing
     types. Returns (wide_df, dup_report):
-      wide_df: sample_id, source, then one column per taxon (genus_species
-        where both are known, else the most specific available rank) --
-        the BARE original name, with no virus_/prok_/unk_ domain prefix.
-        What a column actually is (full lineage, domain call + evidence)
-        lives in the sibling *.taxonomy.tsv from build_taxonomy_table(),
-        not baked into the header -- a wrong classification no longer
+      wide_df: sample_id, source, then one column per taxon, using the
+        RAW taxon string exactly as the source deposited it (e.g.
+        "d__Bacteria;p__Cloacimonadota" stays exactly that, sanitized only
+        for filesystem/TSV-safe characters -- never shortened to just
+        "Cloacimonadota" or any other derived label, and never given a
+        virus_/prok_/unk_ domain prefix). What a column actually MEANS
+        (full per-rank breakdown, domain call + evidence) lives in the
+        sibling *.taxonomy.tsv from build_taxonomy_table(), not baked into
+        or inferred from the header -- a wrong classification no longer
         means renaming a column retroactively invalidates anything that
-        already keyed off its name. A (sample, taxon) cell with NO
-        underlying row is left BLANK (NaN), never silently zero-filled.
+        already keyed off its name, and a user who wants to know what a
+        column represents always looks it up there rather than relying on
+        an abbreviated name we chose on their behalf. A (sample, taxon)
+        cell with NO underlying row is left BLANK (NaN), never silently
+        zero-filled.
       dup_report: rows where the SAME (sample, taxon) pair had more than
         one raw value within this one table -- these are surfaced, not
         summed; the corresponding wide_df cell is left blank pending
@@ -276,8 +283,7 @@ def build_table_matrix(table_df, max_cells: int = 20_000_000):
     if table_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     df = table_df.copy()
-    df["taxon_label"] = df.apply(taxon_label_for, axis=1)
-    df["col_name"] = df["taxon_label"].astype(str).str.replace(r"[^\w]+", "_", regex=True)
+    df["col_name"] = df["taxon"].map(col_name_for)
 
     n_samples = df["sample_id"].nunique()
     n_cols = df["col_name"].nunique()
