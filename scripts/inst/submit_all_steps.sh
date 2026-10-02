@@ -2,8 +2,8 @@
 #SBATCH --job-name=virusDB
 #SBATCH --partition=small
 #SBATCH --time=1-00:00:00
-#SBATCH --mem=12G
-#SBATCH --cpus-per-task=1
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=2
 #SBATCH --output=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_all_steps.out
 #SBATCH --error=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_all_steps.err
 #SBATCH --mail-user=yanting@unc.edu
@@ -88,23 +88,37 @@ OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 #     --max-study-mb 500 \
 #     --workers "${WORKERS}"
 
-# download + analysize (can pause)
-python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
-    --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
-    --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
-    --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix_v2 \
-    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v2.jsonl \
-    --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
-    --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
-    --workers "${WORKERS}" \
-    --range "50"
+# python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
+#     --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+#     --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
+#     --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix_v3 \
+#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v3_vontest2.jsonl \
+#     --scratch /tmp/vontest2_scratch \
+#     --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
+#     --paper-id "10.3390/biology15080605" \
+#     --rebuild
 
-# combine
-python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py build \
-    --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
-    --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v2.jsonl \
-    --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies_v2.tsv \
-    --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample_v2.tsv \
-    --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download_v2.tsv \
-    --table-manifest-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/table_manifest_v2.tsv \
-    --needs-review-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/needs_review_tables_v2.tsv
+# # download + analysize (can pause)
+# python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py extract \
+#     --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+#     --datasets /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/dataset_candidates_final.csv \
+#     --data-dir /hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix_v3 \
+#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v3.jsonl \
+#     --scratch /tmp/${SLURM_JOB_ID}_mb_stage7 \
+#     --raw-store /hickory/proj/didonglab/dataset/virus/Database/data/raw_files \
+#     --workers "${WORKERS}" \
+#     --range "10"
+
+# # combine
+# python3 scripts/extract_abundance_matrix/stage7_extract_abundance_matrix.py build \
+#     --abundance-ready /hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv \
+#     --progress /hickory/proj/didonglab/dataset/virus/Database/results/stage7_extract/progress_v3.jsonl \
+#     --studies-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/studies_v3.tsv \
+#     --sample-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/sample_v3.tsv \
+#     --blocked-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/blocked_manual_download_v3.tsv \
+#     --table-manifest-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/table_manifest_v3.tsv \
+#     --needs-review-tsv /hickory/proj/didonglab/dataset/virus/Database/metadata/needs_review_tables_v3.tsv
+
+
+# rewrite search abundance paper
+
