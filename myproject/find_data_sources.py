@@ -103,7 +103,7 @@ def find_data_sources(paper_id, timeout=30):
     sections = []
     for node in root.iter():
         tag = node.tag.rsplit("}", 1)[-1]
-        if tag not in {"sec", "notes", "fn"}:
+        if tag not in {"sec", "notes", "fn", "fn-group"}:
             continue
 
         title = " ".join(
@@ -119,7 +119,9 @@ def find_data_sources(paper_id, timeout=30):
         if (
             re.search(
                 r"data[\s_-]*(?:availability|accessibility)"
-                r"|availability\s+of\s+data",
+                r"|availability\s+of\s+(?:supporting\s+)?data"
+                r"|(?:data|dna)\s+deposition|data\s+records|data\s+summary"
+                r"|accession\s+codes?",
                 title + " " + section_type,
                 re.I,
             )
@@ -127,12 +129,6 @@ def find_data_sources(paper_id, timeout=30):
             or re.fullmatch(r"(?:associated[\s_-]+)?data", section_type.strip(), re.I)
         ):
             sections.append(node)
-
-    if not sections:
-        raise RuntimeError(
-            "Full text has been read, but no Data Availability section was identified;"
-            "additional section identification rules may be needed."
-        )
 
     def section_name(section):
         title = " ".join(
@@ -217,6 +213,7 @@ def find_data_sources(paper_id, timeout=30):
                 resource = "bioproject"
             else:
                 resource = {
+                    "DRA": "sra-submission",
                     "DRP": "sra-study",
                     "DRR": "sra-run",
                     "DRX": "sra-experiment",
@@ -224,6 +221,9 @@ def find_data_sources(paper_id, timeout=30):
                 }[accession[:3]]
 
             return f"https://ddbj.nig.ac.jp/resource/{resource}/{accession}"
+
+        if platform == "CNGBdb":
+            return f"https://db.cngb.org/search/project/{accession}/"
 
         raise ValueError(f"No raw reads link rule for platform: {platform}")
 
@@ -283,11 +283,14 @@ def find_data_sources(paper_id, timeout=30):
                     for child in target
                     if child.tag.rsplit("}", 1)[-1] == "title"
                 )
-                if re.search(
-                    r"supporting\s+information|supplementary\s+"
-                    r"(?:information|materials?|data)",
-                    target_title,
-                    re.I,
+                if (
+                    re.search(
+                        r"supporting\s+information|supplementary\s+"
+                        r"(?:information|materials?|data)",
+                        target_title,
+                        re.I,
+                    )
+                    or target.tag.rsplit("}", 1)[-1] == "supplementary-material"
                 ) and target not in selected:
                     sections.append(target)
                     selected.add(target)
@@ -311,9 +314,13 @@ def find_data_sources(paper_id, timeout=30):
         nonlocal pmc_links
 
         if pmc_links is None:
-            parser = LinkParser()
-            parser.feed(read_url(pmc_page_url).decode("utf-8"))
-            pmc_links = parser.links
+            # The page is sometimes served as a reCAPTCHA challenge under load
+            try:
+                parser = LinkParser()
+                parser.feed(read_url(pmc_page_url).decode("utf-8"))
+                pmc_links = parser.links
+            except Exception:
+                pmc_links = []
 
         filename = urllib.parse.unquote(
             urllib.parse.urlsplit(filename).path
@@ -327,9 +334,10 @@ def find_data_sources(paper_id, timeout=30):
             if link_filename == filename:
                 return urllib.parse.urljoin(pmc_page_url, href)
 
-        raise RuntimeError(
-            f"PMC web unable to find supplementary file: {filename}；"
-            "The webpage might be blocked by anti-scraping measures, or the attachment link format may require a new rule."
+        # Fall back to PMC's standard attachment URL format
+        return (
+            f"https://pmc.ncbi.nlm.nih.gov/articles/instance/"
+            f"{pmcid[3:]}/bin/{urllib.parse.quote(filename)}"
         )
 
     # Attachment links may be relative filenames inside <media>
@@ -358,11 +366,40 @@ def find_data_sources(paper_id, timeout=30):
 
     # 4. Extract links and raw reads accessions
     accession_pattern = (
-        r"\b(?:PRJNA\d+|PRJEB\d+|PRJDB\d+|[SED]R[PRSX]\d+|CRA\d+)\b"
+        r"\b(?:PRJNA\d+|PRJEB\d+|PRJDB\d+|[SED]R[APRSX]\d+|SAMN\d+"
+        r"|CRA\d+|CNP\d+)\b"
     )
 
-    for section in sections:
-        source_section = section_name(section)
+    # Deposition statements may also appear in Methods, outside Data Availability
+    in_sections = {node for section in sections for node in section.iter()}
+    body = next(
+        (node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "body"),
+        None,
+    )
+    methods_paragraphs = [
+        node for node in (body.iter() if body is not None else [])
+        if node.tag.rsplit("}", 1)[-1] == "p"
+        and node not in in_sections
+        and re.search(
+            r"\b(?:deposited|submitted|archived)\b"
+            r"|sequenc(?:e|ing) data .{0,60}available (?:at|from|in)\b"
+            r"|\baccession codes?\b",
+            " ".join(node.itertext()),
+            re.I,
+        )
+    ]
+
+    if not sections and not methods_paragraphs:
+        raise RuntimeError(
+            "Full text has been read, but no Data Availability section was identified;"
+            "additional section identification rules may be needed."
+        )
+
+    for section in sections + methods_paragraphs:
+        source_section = (
+            "Methods" if section in methods_paragraphs
+            else section_name(section)
+        )
 
         paragraphs = [
             node for node in section.iter()
@@ -382,12 +419,25 @@ def find_data_sources(paper_id, timeout=30):
 
             content = " ".join(paragraph.itertext())
             urls.extend(re.findall(r"""https?://[^\s<>"']+""", content))
+            # Bare repository DOIs, e.g. "10.6084/m9.figshare.123"
+            urls.extend(
+                "https://doi.org/" + doi
+                for doi in re.findall(
+                    r"(?<![/\w.])10\.(?:6084|5281|5061)/[^\s<>\"'\[\];,]+",
+                    content,
+                )
+            )
             urls = list(dict.fromkeys(
                 url.rstrip(".,;:)") for url in urls
             ))
 
             has_sra = bool(re.search(
-                r"\bSRA\b|\bSequence Read Archive\b", content, re.I
+                r"\bSRA\b|\b(?:Sequence|Short) Read Archive\b"
+                r"|\bNCBI\b|\bBioProject\b|\bGenBank\b"
+                r"|\bNational Center for Biotechnology Information\b"
+                r"|\bEuropean Nucleotide Archive\b",
+                content,
+                re.I,
             ))
             raw_urls = []
 
@@ -434,8 +484,10 @@ def find_data_sources(paper_id, timeout=30):
                     platform = "ENA"
                 elif accession.startswith(("PRJDB", "DR")):
                     platform = "DDBJ DRA"
+                elif accession.startswith("CNP"):
+                    platform = "CNGBdb"
                 else:
-                    # PRJNA is BioProject code, need paragraph shown "SRA" as an evidence
+                    # PRJNA is BioProject code, need paragraph shown SRA/NCBI as an evidence
                     if accession.startswith("PRJNA") and not has_sra:
                         continue
                     platform = "NCBI SRA"

@@ -1,3 +1,8 @@
+import threading
+
+_PAPER_INDEX_LOCK = threading.Lock()
+
+
 def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
     import json
     import re
@@ -67,75 +72,76 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
         raise RuntimeError("First author's last name or publication year is missing")
 
     def safe_name(name):
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+        name = re.sub(r'[<>:"/\\\\|?*\x00-\x1f]', "_", name)
         return name.strip(" .") or "unnamed"
 
     # 2. Reuse the directory registered for this paper
-    output_dir = Path(output_dir).expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with _PAPER_INDEX_LOCK:
+        output_dir = Path(output_dir).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    index_file = output_dir / "paper_index.json"
+        index_file = output_dir / "paper_index.json"
 
-    if index_file.exists():
-        with index_file.open("r", encoding="utf-8") as handle:
-            paper_index = json.load(handle)
-    else:
-        paper_index = {}
+        if index_file.exists():
+            with index_file.open("r", encoding="utf-8") as handle:
+                paper_index = json.load(handle)
+        else:
+            paper_index = {}
 
-    # DOI 优先，避免同一篇分别输入 DOI、PMID 时重复建目录
-    paper_key = (
-        record.get("doi")
-        or record.get("pmcid")
-        or pid
-    ).strip().lower()
+        # DOI 优先，避免同一篇分别输入 DOI、PMID 时重复建目录
+        paper_key = (
+            record.get("doi")
+            or record.get("pmcid")
+            or pid
+        ).strip().lower()
 
-    def letter_suffix(number):
-        suffix = ""
-        while number:
-            number, remainder = divmod(number - 1, 26)
-            suffix = chr(97 + remainder) + suffix
-        return suffix
+        def letter_suffix(number):
+            suffix = ""
+            while number:
+                number, remainder = divmod(number - 1, 26)
+                suffix = chr(97 + remainder) + suffix
+            return suffix
 
-    if paper_key in paper_index:
-        folder_name = paper_index[paper_key]["folder_name"]
-        paper_dir = output_dir / folder_name
-        paper_dir.mkdir(exist_ok=True)
-    else:
-        base_name = safe_name(f"{last_name}{year}")
-        used_names = {
-            item["folder_name"] for item in paper_index.values()
-        }
-        index = 0
-
-        while True:
-            folder_name = (
-                base_name if index == 0
-                else f"{base_name}_{letter_suffix(index)}"
-            )
+        if paper_key in paper_index:
+            folder_name = paper_index[paper_key]["folder_name"]
             paper_dir = output_dir / folder_name
+            paper_dir.mkdir(exist_ok=True)
+        else:
+            base_name = safe_name(f"{last_name}{year}")
+            used_names = {
+                item["folder_name"] for item in paper_index.values()
+            }
+            index = 0
 
-            if folder_name in used_names or paper_dir.exists():
-                index += 1
-                continue
+            while True:
+                folder_name = (
+                    base_name if index == 0
+                    else f"{base_name}_{letter_suffix(index)}"
+                )
+                paper_dir = output_dir / folder_name
 
-            try:
-                paper_dir.mkdir()
-                break
-            except FileExistsError:
-                index += 1
+                if folder_name in used_names or paper_dir.exists():
+                    index += 1
+                    continue
 
-        paper_index[paper_key] = {
-            "folder_name": folder_name,
-            "title": record.get("title", ""),
-        }
+                try:
+                    paper_dir.mkdir()
+                    break
+                except FileExistsError:
+                    index += 1
 
-        temporary_file = index_file.with_suffix(".json.tmp")
-        with temporary_file.open("w", encoding="utf-8") as handle:
-            json.dump(paper_index, handle, ensure_ascii=False, indent=2)
-        temporary_file.replace(index_file)
+            paper_index[paper_key] = {
+                "folder_name": folder_name,
+                "title": record.get("title", ""),
+            }
 
-    original_dir = paper_dir / "Original Data"
-    original_dir.mkdir(exist_ok=True)
+            temporary_file = index_file.with_suffix(".json.tmp")
+            with temporary_file.open("w", encoding="utf-8") as handle:
+                json.dump(paper_index, handle, ensure_ascii=False, indent=2)
+            temporary_file.replace(index_file)
+
+        original_dir = paper_dir / "Original_Data"
+        original_dir.mkdir(exist_ok=True)
 
     if data_sources is None:
         data_sources = find_data_sources(paper_id, timeout=timeout)
@@ -170,6 +176,221 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
         return path
 
     # 3. Download attachments; inspect HTML for direct file links
+    figshare_filenames = {}
+
+    def figshare_files(url):
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        path = urllib.parse.unquote(parsed.path)
+
+        kind = None
+        object_id = None
+        version = None
+
+        # DOI：figshare 集合或单个条目
+        if host in {"doi.org", "dx.doi.org"}:
+            match = re.fullmatch(
+                r"/10\.6084/m9\.figshare\.(c\.)?(\d+)(?:\.v(\d+))?/?",
+                path,
+                re.I,
+            )
+            if match:
+                kind = "collections" if match.group(1) else "articles"
+                object_id = match.group(2)
+                version = match.group(3)
+
+        # figshare 网页：集合或单个条目
+        elif host == "figshare.com" or host.endswith(".figshare.com"):
+            match = re.fullmatch(
+                r"/(collections|articles)/(?:[^/]+/)*?(\d+)(?:/(\d+))?/?",
+                path,
+                re.I,
+            )
+            if match:
+                kind = match.group(1).lower()
+                object_id = match.group(2)
+                version = match.group(3)
+
+        # 非 figshare 条目链接，继续原来的下载逻辑
+        if kind is None:
+            return None
+
+        def read_json(api_url):
+            import time
+            time.sleep(1)
+            with request_url(api_url) as response:
+                return json.load(response)
+
+        api_url = f"https://api.figshare.com/v2/{kind}/{object_id}"
+        if version:
+            api_url += f"/versions/{version}"
+
+        if kind == "collections":
+            articles = []
+            page = 1
+            while True:
+                batch = read_json(
+                    f"{api_url}/articles?page={page}&page_size=100"
+                )
+                articles.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        else:
+            articles = [{"url": api_url}]
+
+        links = []
+        for article in articles:
+            article_url = (
+                article.get("url")
+                or f"https://api.figshare.com/v2/articles/{article['id']}"
+            )
+            try:
+                details = read_json(article_url)
+                for file_info in details.get("files", []) or []:
+                    filename = file_info.get("name") or ""
+                    if filename.lower().endswith(
+                        (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+                    ):
+                        continue
+
+                    download_url = file_info.get("download_url")
+                    if download_url:
+                        links.append(download_url)
+                        if filename:
+                            figshare_filenames[download_url] = filename
+                    else:
+                        issues.append({
+                            "link": article_url,
+                            "file_name": filename,
+                            "reason": "figshare file has no download URL",
+                        })
+            except Exception as exc:
+                issues.append({
+                    "link": article_url,
+                    "reason": f"figshare file listing failed: {exc}",
+                })
+
+        return list(dict.fromkeys(links))
+
+    # Zenodo record pages also link /preview/ pages; list files via the API
+    def zenodo_files(url):
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        path = urllib.parse.unquote(parsed.path)
+
+        if host in {"doi.org", "dx.doi.org"}:
+            match = re.fullmatch(r"/10\.5281/zenodo\.(\d+)/?", path, re.I)
+        elif host == "zenodo.org":
+            match = re.fullmatch(r"/records?/(\d+)/?", path)
+        else:
+            match = None
+        if not match:
+            return None
+
+        import time
+        time.sleep(1)
+        api_url = f"https://zenodo.org/api/records/{match.group(1)}"
+        try:
+            with request_url(api_url) as response:
+                details = json.load(response)
+        except Exception as exc:
+            issues.append({
+                "link": api_url,
+                "reason": f"zenodo file listing failed: {exc}",
+            })
+            return []
+
+        links = []
+        for file_info in details.get("files", []) or []:
+            filename = file_info.get("key") or ""
+            if filename.lower().endswith(
+                (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+            ):
+                continue
+            download_url = (file_info.get("links") or {}).get("self")
+            if download_url:
+                links.append(download_url)
+                if filename:
+                    figshare_filenames[download_url] = filename
+        return list(dict.fromkeys(links))
+
+    def queue_figshare(url, depth, queue):
+        links = figshare_files(url)
+        if links is None:
+            links = zenodo_files(url)
+        if links is None:
+            return False
+        if links:
+            queue.extend((link, depth + 1) for link in links)
+        else:
+            issues.append({
+                "link": url,
+                "reason": "No downloadable non-raw-read files returned by figshare/zenodo",
+            })
+        return True
+
+    # PMC attachment URLs now return a JS proof-of-work page;
+    # fetch the same file from the PMC Open Access S3 bucket instead
+    pmc_oa_keys = {}
+
+    def pmc_oa_url(url):
+        import html
+
+        parsed = urllib.parse.urlsplit(url)
+        match = re.fullmatch(
+            r"/articles/instance/(\d+)/bin/([^/]+)",
+            urllib.parse.unquote(parsed.path),
+        )
+        if parsed.hostname != "pmc.ncbi.nlm.nih.gov" or not match:
+            return None
+
+        pmcid, filename = f"PMC{match.group(1)}", match.group(2)
+        if pmcid not in pmc_oa_keys:
+            try:
+                with request_url(
+                    "https://pmc-oa-opendata.s3.amazonaws.com/?"
+                    + urllib.parse.urlencode({
+                        "list-type": "2",
+                        "prefix": f"{pmcid}.",
+                    })
+                ) as response:
+                    listing = response.read().decode("utf-8")
+                pmc_oa_keys[pmcid] = [
+                    html.unescape(key)
+                    for key in re.findall(r"<Key>([^<]+)</Key>", listing)
+                ]
+            except Exception:
+                pmc_oa_keys[pmcid] = []
+
+        # Keys look like PMC123.2/file.zip; take the latest version
+        candidates = [
+            key for key in pmc_oa_keys[pmcid]
+            if key.rsplit("/", 1)[-1] == filename
+        ]
+        if not candidates:
+            return None
+
+        latest = max(
+            candidates,
+            key=lambda key: int(key.split("/", 1)[0].rsplit(".", 1)[-1]),
+        )
+        return (
+            "https://pmc-oa-opendata.s3.amazonaws.com/"
+            + urllib.parse.quote(latest)
+        )
+
+    # GitHub blob pages are HTML; the raw file is on raw.githubusercontent.com
+    def github_raw_url(url):
+        parsed = urllib.parse.urlsplit(url)
+        match = re.fullmatch(r"/([^/]+)/([^/]+)/blob/(.+)", parsed.path)
+        if parsed.hostname != "github.com" or not match:
+            return None
+        return (
+            "https://raw.githubusercontent.com/"
+            f"{match.group(1)}/{match.group(2)}/{match.group(3)}"
+        )
+
     visited = set()
 
     for source in data_sources:
@@ -197,8 +418,15 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
             visited.add(url)
 
             try:
-                with request_url(url) as response:
+                if queue_figshare(url, depth, queue):
+                    continue
+                with request_url(
+                    pmc_oa_url(url) or github_raw_url(url) or url
+                ) as response:
                     actual_url = response.geturl()
+                    if actual_url != url:
+                        if queue_figshare(actual_url, depth, queue):
+                            continue
                     content_type = response.headers.get("Content-Type", "").lower()
                     head = response.read(512)
 
@@ -258,7 +486,9 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
 
                         links = []
                         for href in parser.links:
-                            link = urllib.parse.urljoin(actual_url, href)
+                            link = urllib.parse.urldefrag(
+                                urllib.parse.urljoin(actual_url, href)
+                            )[0]
                             parsed = urllib.parse.urlsplit(link)
                             if parsed.scheme not in {"http", "https"}:
                                 continue
@@ -280,7 +510,11 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
                             ):
                                 links.append(link)
 
-                        links = list(dict.fromkeys(links))
+                        # Already-visited links would be skipped silently
+                        links = [
+                            link for link in dict.fromkeys(links)
+                            if link not in visited
+                        ]
 
                         if links and depth < 2:
                             queue.extend((link, depth + 1) for link in links)
@@ -298,7 +532,10 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
                     message["Content-Disposition"] = response.headers.get(
                         "Content-Disposition", ""
                     )
-                    filename = message.get_filename()
+                    filename = (
+                        figshare_filenames.get(url)
+                        or message.get_filename()
+                    )
 
                     if not filename:
                         filename = urllib.parse.unquote(
@@ -351,7 +588,11 @@ def find_candidate_files(paper_id, output_dir, data_sources=None, timeout=30):
         try:
             with zipfile.ZipFile(path) as archive:
                 for member in archive.infolist():
-                    relative = Path(member.filename.replace("\\", "/"))
+                    relative = Path(member.filename.replace("\\\\", "/"))
+                    if relative.name.lower().endswith(
+                        (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+                    ):
+                        continue
 
                     if relative.is_absolute() or ".." in relative.parts:
                         raise ValueError(f"Unsafe ZIP path: {member.filename}")

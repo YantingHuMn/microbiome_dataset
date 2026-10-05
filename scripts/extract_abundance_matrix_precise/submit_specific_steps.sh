@@ -2,8 +2,8 @@
 #SBATCH --job-name=virusDB
 #SBATCH --partition=small
 #SBATCH --time=1-00:00:00
-#SBATCH --mem=64G
-#SBATCH --cpus-per-task=2
+#SBATCH --mem=270G
+#SBATCH --cpus-per-task=16
 #SBATCH --output=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_specific_steps.out
 #SBATCH --error=/hickory/proj/didonglab/dataset/virus/Database/results/logs/submit_specific_steps.err
 #SBATCH --mail-user=yanting@unc.edu
@@ -35,4 +35,7 @@ OUT_DIR="/hickory/proj/didonglab/dataset/virus/Database/results"
 
 
 # rewrite search abundance paper
-
+python /hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/scripts/extract_abundance_matrix_precise/stage7_extract_abundance_matrix_precise.py \
+    --input_csv "/hickory/proj/didonglab/dataset/virus/Database/results/stage5_final/abundance_ready.csv" \
+    --out_dir "/hickory/proj/didonglab/dataset/virus/Database/data/abundance_matrix_precise_v2" \
+    --workers ${WORKERS}
