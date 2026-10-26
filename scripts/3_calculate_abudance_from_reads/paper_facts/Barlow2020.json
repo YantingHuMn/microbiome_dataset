@@ -1,0 +1,128 @@
+{
+  "paper_folder": "Barlow2020",
+  "doi": "10.1038/s41467-020-16224-6",
+  "verified_on": "2026-10-22",
+  "sources": [
+    "Full text: PMC7244552 (Nat Commun 11:2590), '16S rRNA gene amplicon sequencing'",
+    "Supplementary Table 6 (41467_2020_16224_MOESM1_ESM.pdf p.11): the exact primer sequences",
+    "Source data Fig4B_data.xlsx (41467_2020_16224_MOESM3_ESM.zip): the mouse -> diet / cage / site key"
+  ],
+  "amplicon": {
+    "status": "verified",
+    "region": "16S_V4",
+    "paper_statement": "The V4 region was amplified with barcoded universal primers 'modified from the standard 515F-806R primers to reduce host mitochondrial rRNA gene amplification'. Supplementary Table 6 lists the pair as 519F-806R. Sequenced by Fulgent Genetics on MiSeq, 2 x 300 bp.",
+    "forward_primer": {
+      "name": "519F (truncated 515F)",
+      "seq": "CAGCMGCCGCGGTAA",
+      "length": 15
+    },
+    "reverse_primer": {
+      "name": "806R",
+      "seq": "GGACTACHVGGGTWTCTAAT",
+      "length": 20
+    },
+    "primers_in_reads": false,
+    "primer_evidence": "The paper's own primers were checked against the reads and are absent (0% of R1 and R2 over 3 runs x 3000 reads). The reads begin at TACGTAGGTG etc., i.e. the 16S sequence immediately 3' of 519F, so the libraries reached ENA already primer-trimmed. Therefore trimLeft = 0: trimming the stated primer lengths again would cut 15 and 20 bp of real sequence.",
+    "read_length": [
+      301,
+      301
+    ],
+    "trim_left": [
+      0,
+      0
+    ],
+    "insert_length_primer_free": {
+      "method": "measured two independent ways that agree: 83.4% of R1 reads run through into revcomp(806R), and R1 vs revcomp(R2) overlap alignment over 2412 pairs",
+      "min": 250,
+      "p1": 252,
+      "p5": 252,
+      "median": 253,
+      "p95": 253,
+      "p99": 253,
+      "max": 254,
+      "modes": [
+        253,
+        252,
+        254
+      ],
+      "note": "Essentially a fixed-length amplicon (the classic 253 bp V4), unlike V3-V4 or V1-V3. The 0.5% tail out to ~420 bp in the overlap probe is mis-aligned junk, not a real second mode."
+    },
+    "trunc_len_basis": "RAW read coordinates (truncLen applies before trimLeft, and trimLeft is 0 here, so truncLen is the retained biological length directly).",
+    "merge_budget": {
+      "min_overlap": 12,
+      "required_raw_sum": 265,
+      "formula": "truncLen[1] + truncLen[2] >= 253 + 12 + 0 + 0",
+      "available_raw_sum": 602,
+      "slack": 337
+    },
+    "read_through": "SEVERE and must be handled: the reads are 301 bp but the insert is 253 bp, so 83% of reads run past the far end into the reverse primer and adaptor. truncLen MUST be <= 253 on both mates. Truncating at the read length would denoise adaptor sequence as if it were 16S.",
+    "max_trunc_len": [
+      253,
+      253
+    ],
+    "max_trunc_len_reason": "capped at the insert length: beyond it the read is adaptor, not 16S"
+  },
+  "sample_identity": {
+    "status": "verified",
+    "n_runs": 117,
+    "n_biosamples": 116,
+    "n_biological_mouse_samples": 94,
+    "technical_controls_in_run_set": {
+      "count": 22,
+      "rule": "aliases beginning Buffer_, GF_ or CC_SW_Chow_ are NOT mouse gut samples and must be excluded from any abundance matrix",
+      "what_they_are": "Buffer_* extraction blanks; GF_* germ-free small-intestine and stool negative controls; CC_SW_Chow_* a cecal-contents dilution series and sequencing replicates used to establish the limits of quantification",
+      "keep_them_for": "contaminant identification and limit-of-quantification checks, as their own table"
+    },
+    "alias_decoder": {
+      "pattern": "M<n><P|NP>_<site>",
+      "mouse": "M1-M6",
+      "P_vs_NP": "the two cage-mates within one cage; what P/NP abbreviates is not stated in the paper and is NOT needed for the group assignment, so it is left unexpanded rather than guessed",
+      "sites": {
+        "D0_Stool / D4_Stool / D7_Stool / D10_Stool": "stool at days 0, 4, 7, 10",
+        "SC": "Stomach Contents",
+        "USI-C": "Upper SI Contents",
+        "USI-S": "Upper SI Mucosa",
+        "LSI-C": "Lower SI Contents",
+        "LSI-S": "Lower SI Mucosa",
+        "CC": "Cecum Contents",
+        "LI-S": "Colon Mucosa"
+      },
+      "evidence": "the Source/Site columns of Fig4B_data.xlsx give these expansions verbatim"
+    },
+    "group_assignment": {
+      "status": "verified",
+      "key": {
+        "M1": "Keto",
+        "M2": "Keto",
+        "M3": "Keto",
+        "M4": "Control",
+        "M5": "Control",
+        "M6": "Control"
+      },
+      "evidence": "The Diet column of Fig4B_data.xlsx assigns Keto to M1-M3 and Control to M4-M6, for both the P and NP cage-mate. That gives 6 ketogenic and 6 control mice, matching the paper's 'split into two groups (n = 6 each)'.",
+      "caution": "The group follows the MOUSE NUMBER, not the P/NP suffix. Cage is fully confounded with diet (cage n holds mouse n's pair), so cage cannot be used as a covariate.",
+      "design_note": "Day 0 stool was taken BEFORE the diets were introduced, so D0 samples are baseline for both arms, not yet keto."
+    },
+    "usable_for": [
+      "ASV / relative-abundance tables",
+      "ketogenic vs control contrasts",
+      "GI-site and timepoint comparisons"
+    ],
+    "not_usable_for": [
+      "absolute abundance: the dPCR anchor is in the paper's source data, not the FASTQs",
+      "cage as a covariate: cage is confounded with diet"
+    ],
+    "exclude_alias_prefixes": [
+      "Buffer_",
+      "GF_",
+      "CC_SW_Chow_"
+    ]
+  },
+  "experiment": {
+    "host": "Mus musculus (Swiss Webster, 4 weeks old at diet start)",
+    "body_site": "GI tract: stool plus lumenal contents and mucosa from stomach, upper/lower small intestine, cecum and colon",
+    "design": "ketogenic diet vs vitamin/mineral-matched control diet, n = 6 mice each; stool at days 0/4/7/10, all other sites at day 10 necropsy",
+    "disease": "none (dietary intervention in healthy mice)",
+    "note": "The paper's own quantification is ABSOLUTE abundance (16S copies by dPCR x relative abundance). Re-deriving relative abundance from the reads reproduces only the relative half; the dPCR anchor is in the paper's source data, not in the FASTQs."
+  }
+}

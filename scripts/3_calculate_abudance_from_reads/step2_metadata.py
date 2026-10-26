@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Step 2: resolve what each FASTQ actually is, and decide what may follow.
+
+Two stages, in this order:
+
+  1. ENA   the mechanical chain, FASTQ -> run -> experiment -> BioSample. Free,
+           fast and reliable, but it almost never says which sample is a case
+           and which a control.
+  2. model one unattended session per paper (llm_extract.py) that reads the
+           paper, its supplementary material, the authors' repository and the
+           NCBI records to finish the chain: BioSample -> the paper's own sample
+           id -> group / subject / tissue / timepoint, with evidence per field.
+
+Finding a BioSample accession is NOT knowing what the sample is, so stage 1
+alone can never open the gate on its own.
+
+Writes into --out-dir:
+    run_sample_mapping.csv   one row per FASTQ, traced run -> experiment -> BioSample
+    sample_metadata.csv      one row per BIOLOGICAL sample
+    metadata_gate.txt        pass / pass_quantification_only / blocked:<reason>
+    README_metadata.md       what was resolved, from where, and what was not
+    metadata_llm/            prompt sent, session logs, raw answer, call status
+
+Gate, judged on two questions separately:
+    pass                       sample identity AND the key experimental facts
+                               are established; grouped analysis is supported
+    pass_quantification_only   each FASTQ maps to a distinct biological sample,
+                               so per-sample matrices are sound, but the group
+                               labels are not confirmed. Step 3 may run; any
+                               grouped comparison may not.
+    blocked:<reason>           the core mapping is unclear; this paper stops and
+                               the others carry on
+Missing optional covariates (timepoint, subject id, sex) never block on their own.
+
+Values the model proposed but could not confirm are kept in `proposed_values`,
+never promoted into the field itself. Missing values are one of three distinct
+strings: `not_applicable`, `not_reported`, `unresolved`.
+"""
+
+import argparse
+import collections
+import csv
+import io
+import json
+import os
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import branches
+import llm_extract
+
+HERE = Path(__file__).resolve().parent
+NOT_REPORTED = "not_reported"
+UNRESOLVED = "unresolved"
+ENA_FIELDS = ("run_accession,experiment_accession,sample_accession,study_accession,"
+              "library_strategy,library_source,library_selection,library_layout,"
+              "instrument_model,read_count,scientific_name,host,host_tax_id,"
+              "isolation_source,environment_material,sample_title,sample_alias,description")
+# Resolved per sample by the model. The first two decide the gate; the rest are
+# covariates whose absence is recorded but never blocking.
+CORE_FIELDS = llm_extract.REQUIRED_SAMPLE_FIELDS
+EXTRA_FIELDS = llm_extract.ANALYSIS_SAMPLE_FIELDS
+
+
+def ena_runs(study, timeout=90):
+    q = urllib.parse.urlencode({"accession": study, "result": "read_run",
+                                "fields": ENA_FIELDS, "format": "tsv", "limit": "0"})
+    with urllib.request.urlopen(
+            "https://www.ebi.ac.uk/ena/portal/api/filereport?" + q, timeout=timeout) as r:
+        return list(csv.DictReader(io.StringIO(r.read().decode()), delimiter="\t"))
+
+
+def clean(value):
+    v = (value or "").strip()
+    return v if v and v.lower() not in ("missing", "na", "n/a", "none", "unknown") else NOT_REPORTED
+
+
+def branch_of(strategy, source, selection=None):
+    """Which step-3 branch this library belongs to. Never defaults to 16S.
+
+    Shared with step 3 through branches.py so the two cannot disagree about
+    what a branch name means. AMPLICON stays `amplicon` here: whether it is
+    16S, ITS or 18S is a question about the reads, not about ENA's fields.
+    """
+    return branches.branch_from_ena(strategy, source, selection)
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- model stage
+def cached_extraction(work_dir, expected):
+    """A previously validated answer, so a rerun costs nothing. None if absent."""
+    data, problems = llm_extract.validate(work_dir / "metadata_extraction.json", expected)
+    status = work_dir / "llm_status.json"
+    if data is None or problems or not status.exists():
+        return None
+    try:
+        if not json.loads(status.read_text(encoding="utf-8")).get("ok"):
+            return None
+    except (OSError, ValueError):
+        return None
+    return data
+
+
+def run_model_stage(args, paper_meta, ena_rows, downloaded_runs, log):
+    """Returns (by_biosample, scheme, key_experiment, note).
+
+    A study often holds more runs than were downloaded. The extra rows stay in
+    ena_runs.tsv as lookup context - they are frequently what explains a naming
+    scheme - but the task, and the validator, are scoped to the runs actually
+    present on disk.
+    """
+    work = args.out_dir / "metadata_llm"
+    work.mkdir(parents=True, exist_ok=True)
+    expected = set()
+    if ena_rows:
+        for r in ena_rows:
+            r["in_manifest"] = "yes" if r["run_accession"].strip() in downloaded_runs else "no"
+            if r["in_manifest"] == "yes" and r.get("sample_accession"):
+                expected.add(r["sample_accession"].strip())
+        with (work / "ena_runs.tsv").open("w", encoding="utf-8", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(ena_rows[0].keys()), delimiter="\t")
+            w.writeheader()
+            w.writerows(ena_rows)
+    extra = len(ena_rows) - len(downloaded_runs)
+    if extra > 0:
+        log(f"ena_runs.tsv: {len(downloaded_runs)} downloaded run(s) to resolve, "
+            f"{extra} further run(s) in the same study kept as background only")
+
+    if args.no_llm:
+        return {}, None, None, ("the model stage was switched off for this run "
+                                "(--no-llm); sample identity is unresolved")
+    if not args.refresh_metadata:
+        data = cached_extraction(work, expected)
+        if data:
+            log("reusing the validated extraction already in metadata_llm/ "
+                "(pass --refresh-metadata to redo it)")
+            return (index_samples(data), data["sample_id_scheme"],
+                    data["key_experiment"],
+                    "reused a previously validated extraction")
+
+    facts = HERE / "paper_facts" / f"{args.paper}.json"
+    data, status = llm_extract.extract(
+        args.paper, paper_meta.get("doi", ""), paper_meta.get("title", ""),
+        work, args.reads_root / args.paper / "raw_reads",
+        args.orig_root / args.paper / "Original_Data",
+        facts if facts.exists() else None,
+        expected,
+        agent=args.agent, model=args.model, timeout=args.llm_timeout,
+        retries=args.llm_retries, max_turns=args.max_turns, log=log)
+    if data is None:
+        return {}, None, None, (f"the extraction session did not produce a usable "
+                                f"answer: {status.get('reason')}. Recovery notes are "
+                                f"in {work / 'llm_status.json'}")
+    return (index_samples(data), data["sample_id_scheme"], data["key_experiment"],
+            "resolved by an unattended extraction session")
+
+
+def label_of(sample_row):
+    """A unique handle for one sample, and the provenance of that handle.
+
+    Preference order: the id the paper itself uses, then the same id proposed
+    but not confirmed against the paper, then the submitter's ENA alias. Only
+    the first is a statement about the paper; the others are recorded as what
+    they are.
+    """
+    v = sample_row["paper_sample_id"]
+    if v not in (UNRESOLVED, NOT_REPORTED, ""):
+        return v, "the paper's own sample id"
+    try:
+        proposed = json.loads(sample_row["proposed_values"] or "{}")
+    except ValueError:
+        proposed = {}
+    v = str((proposed.get("paper_sample_id") or {}).get("value") or "").strip()
+    if v:
+        return v, "submitter sample name, not confirmed against the paper"
+    v = sample_row["sample_alias"]
+    if v not in (NOT_REPORTED, ""):
+        return v, "ENA sample_alias"
+    return "", "none"
+
+
+def index_samples(data):
+    """BioSample -> its sample row, with paper-wide defaults already merged in."""
+    defaults = data.get("sample_defaults")
+    out = {}
+    for s in data["samples"]:
+        s["_resolved_fields"] = llm_extract.resolve_fields(s, defaults)
+        out[s["biosample_accession"]] = s
+    return out
+
+
+def confirmed_only(sample):
+    """Split one model sample row into confirmed fact and unconfirmed proposal.
+
+    Confidence is per field, so a confirmed sample id survives even when the
+    group beside it is only a guess - that is exactly the case that separates
+    'quantification only' from 'blocked'.
+    """
+    names = CORE_FIELDS + EXTRA_FIELDS
+    if not sample:
+        return ({f: UNRESOLVED for f in names}, {},
+                {f: UNRESOLVED for f in names}, "")
+    got = sample["_resolved_fields"]
+    fact, proposed, conf, evidence = {}, {}, {}, []
+    for f in names:
+        entry = got.get(f) or {}
+
+        value = str(entry.get("value") or "").strip()
+        c = (entry.get("confidence") or "unknown").strip()
+        conf[f] = c
+        if c == "confirmed" and value:
+            fact[f] = value
+            if entry.get("evidence"):
+                evidence.append(f"{f}: {entry['evidence']}")
+        else:
+            # Unconfirmed values stay out of the field and sit beside it, so
+            # nothing downstream can mistake a suggestion for a fact.
+            fact[f] = UNRESOLVED
+            if value:
+                proposed[f] = {"value": value, "confidence": c,
+                               "evidence": entry.get("evidence", "")}
+    return fact, proposed, conf, " | ".join(evidence)
+
+
+# ------------------------------------------------------------------------ main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--paper", required=True)
+    ap.add_argument("--reads-root", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--status-csv", type=Path, required=True)
+    ap.add_argument("--orig-root", type=Path,
+                    default=Path("/hickory/proj/didonglab/dataset/virus/Database/data/"
+                                 "abundance_matrix_precise_v2"))
+    ap.add_argument("--integration-root", type=Path,
+                    default=Path("/hickory/proj/didonglab/dataset/virus/Database/data/"
+                                 "abudance_integration"))
+    ap.add_argument("--no-llm", action="store_true",
+                    help="skip the extraction session (ENA only; cannot reach 'pass')")
+    ap.add_argument("--refresh-metadata", action="store_true",
+                    help="redo the session even if a validated answer is cached")
+    ap.add_argument("--agent", default="claude", choices=("claude", "codex"))
+    ap.add_argument("--model", default="")
+    ap.add_argument("--llm-timeout", type=int, default=2400)
+    ap.add_argument("--llm-retries", type=int, default=1)
+    ap.add_argument("--max-turns", type=int, default=120)
+    args = ap.parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def log(*a):
+        print(*a, flush=True)
+
+    def finish(verdict):
+        (args.out_dir / "metadata_gate.txt").write_text(verdict + "\n", encoding="utf-8")
+        log(verdict[:400])
+
+    paper_meta = {}
+    with args.status_csv.open(encoding="utf-8-sig", newline="") as fh:
+        for r in csv.DictReader(fh):
+            if r["paper_folder"].strip() == args.paper:
+                paper_meta = r
+                break
+
+    manifest = args.reads_root / args.paper / "raw_reads" / "download_manifest.json"
+    if not manifest.exists():
+        finish("blocked:no download manifest - run step 1 first")
+        return 1
+    files = json.loads(manifest.read_text(encoding="utf-8"))["files"]
+
+    # ---- stage 1: ENA ------------------------------------------------------
+    studies = sorted({f["study_accession"] for f in files})
+    ena, problems = {}, []
+    ena_rows = []
+    for st in studies:
+        try:
+            rows = ena_runs(st)
+            ena_rows += rows
+            ena.update({r["run_accession"]: r for r in rows})
+        except Exception as exc:                      # noqa: BLE001
+            problems.append(f"ENA lookup failed for {st}: {exc}")
+
+    # ---- stage 2: the paper ------------------------------------------------
+    downloaded_runs = {f["run_accession"].strip() for f in files}
+    by_sample_model, scheme, key_exp, model_note = run_model_stage(
+        args, paper_meta, ena_rows, downloaded_runs, log)
+    log(f"metadata: {model_note}")
+
+    # ---- per-FASTQ mapping -------------------------------------------------
+    rows = []
+    for f in files:
+        name = f["url"].rsplit("/", 1)[-1]
+        m = ena.get(f["run_accession"], {})
+        got = by_sample_model.get(f["sample_accession"])
+        fact, _, conf, _ = confirmed_only(got)
+        conf_summary = ";".join(f"{k}={v}" for k, v in conf.items())
+        rows.append({
+            "paper_folder": args.paper, "doi": paper_meta.get("doi", ""),
+            "fastq_path": str(args.reads_root / args.paper / "raw_reads" /
+                              f["run_accession"] / name),
+            "fastq_file": name, "mate": "R1" if "_1." in name else
+                                        ("R2" if "_2." in name else "single"),
+            "run_accession": f["run_accession"],
+            "experiment_accession": m.get("experiment_accession", UNRESOLVED),
+            "biosample_accession": f["sample_accession"],
+            "study_accession": f["study_accession"],
+            "paper_sample_id": fact["paper_sample_id"],
+            "experimental_group": fact["experimental_group"],
+            "is_technical_control": bool(got and got.get("is_technical_control")),
+            "metadata_confidence": conf_summary,
+            "sample_alias": clean(m.get("sample_alias")),
+            "sample_title": clean(m.get("sample_title")),
+            "library_layout": (m.get("library_layout") or f["library_layout"]).upper(),
+            "library_strategy": m.get("library_strategy", UNRESOLVED),
+            "library_source": m.get("library_source", UNRESOLVED),
+            "library_selection": m.get("library_selection", UNRESOLVED),
+            "instrument_model": clean(m.get("instrument_model")),
+            "read_count": m.get("read_count", NOT_REPORTED),
+            "evidence": "ENA filereport + local download_manifest.json"
+                        + ("; paper lookup for the sample identity" if got else ""),
+        })
+    write_csv(args.out_dir / "run_sample_mapping.csv", rows)
+
+    # ---- per-BIOLOGICAL-sample ---------------------------------------------
+    by_sample = collections.defaultdict(list)
+    for r in rows:
+        by_sample[r["biosample_accession"]].append(r)
+
+    samples, blockers = [], list(problems)
+    for sample, rs in sorted(by_sample.items()):
+        runs = sorted({r["run_accession"] for r in rs})
+        exps = sorted({r["experiment_accession"] for r in rs})
+        m = ena.get(runs[0], {})
+        layout = rs[0]["library_layout"]
+        per_run = collections.Counter(r["run_accession"] for r in rs)
+        if layout == "PAIRED" and not all(v == 2 for v in per_run.values()):
+            blockers.append(f"{sample}: paired library with files per run {dict(per_run)}")
+        # Multiple runs are NOT merged here; only flagged with what they share.
+        merge = "single_run"
+        if len(runs) > 1:
+            same_exp = len(exps) == 1
+            merge = ("candidate_technical_replicate_same_experiment" if same_exp
+                     else "MULTIPLE_EXPERIMENTS_do_not_merge_without_review")
+            if not same_exp:
+                blockers.append(f"{sample}: {len(runs)} runs across {len(exps)} experiments")
+        branch, branch_why = branch_of(m.get("library_strategy"),
+                                       m.get("library_source"),
+                                       m.get("library_selection"))
+        if branch == UNRESOLVED:
+            blockers.append(f"{sample}: assay unresolved ({branch_why})")
+        elif branch == "unsupported_isolate_genome":
+            blockers.append(f"{sample}: {branch_why}")
+        got = by_sample_model.get(sample)
+        fact, proposed, conf, evidence = confirmed_only(got)
+        samples.append({
+            "sample_id": sample, "paper_folder": args.paper,
+            "doi": paper_meta.get("doi", ""),
+            "run_accessions": ";".join(runs), "n_runs": len(runs),
+            "experiment_accessions": ";".join(exps),
+            "multi_run_handling": merge,
+            "library_layout": layout,
+            "library_strategy": m.get("library_strategy", UNRESOLVED),
+            "library_source": m.get("library_source", UNRESOLVED),
+            "analysis_branch": branch,
+            "analysis_branch_evidence": branch_why,
+            # ENA scientific_name is the sample's own taxon, not the host.
+            "host": clean(m.get("host")),
+            "scientific_name_raw": clean(m.get("scientific_name")),
+            "isolation_source": clean(m.get("isolation_source")),
+            "environment_material": clean(m.get("environment_material")),
+            "sample_alias": clean(m.get("sample_alias")),
+            "sample_title": clean(m.get("sample_title")),
+            # One column per resolved field, so adding a field to the contract
+            # adds a column here without touching this writer.
+            **{f: fact[f] for f in CORE_FIELDS + EXTRA_FIELDS},
+            "is_technical_control": bool(got and got.get("is_technical_control")),
+            "metadata_confidence": ";".join(f"{k}={v}" for k, v in conf.items()),
+            "metadata_evidence": evidence,
+            # Everything the session suggested but could not confirm, kept apart
+            # so it can be reviewed without ever being read as established.
+            "proposed_values": json.dumps(proposed, ensure_ascii=False) if proposed else "",
+            "evidence": "ENA filereport" + ("; paper lookup" if got else ""),
+        })
+    # A handle for each sample, and where it came from. Papers often print no
+    # sample ids at all; the submitter's alias is then the only sample-level
+    # name in existence, and that is enough to keep samples apart even though
+    # it is not enough to say what any of them means.
+    for s in samples:
+        s["sample_label"], s["sample_label_source"] = label_of(s)
+    write_csv(args.out_dir / "sample_metadata.csv", samples)
+
+    # ---- gate: identity and experiment judged separately -------------------
+    bio = [s for s in samples if not s["is_technical_control"]]
+    n = len(bio) or 1
+    labels = [s["sample_label"] for s in bio]
+    # Quantification needs the samples to be telling-apart-able, nothing more.
+    distinct_ok = all(labels) and len(set(labels)) == len(labels)
+    id_ok = sum(s["paper_sample_id"] not in (UNRESOLVED, NOT_REPORTED, "") for s in bio)
+    grp_ok = sum(s["experimental_group"] not in (UNRESOLVED, NOT_REPORTED, "") for s in bio)
+    exp_missing = [k for k in ("host", "body_site", "design")
+                   if not (key_exp or {}).get(k)] if key_exp else ["host", "body_site", "design"]
+    exp_conf = (key_exp or {}).get("confidence", "unknown")
+
+    if blockers:
+        finish("blocked:" + "; ".join(blockers[:8]))
+        verdict_kind = "blocked"
+    elif not distinct_ok:
+        missing = sum(1 for x in labels if not x)
+        dupes = len(labels) - len(set(labels))
+        finish(f"blocked:the FASTQs cannot be told apart as distinct biological "
+               f"samples - {missing} of {n} have no sample-level name at all and "
+               f"{dupes} name(s) are duplicated. A BioSample accession alone is not "
+               f"an identity. {model_note}")
+        verdict_kind = "blocked"
+    elif grp_ok < n or exp_conf != "confirmed" or exp_missing:
+        why = []
+        if grp_ok < n:
+            why.append(f"group label confirmed for only {grp_ok} of {n} samples")
+        if id_ok < n:
+            why.append(f"the paper's own sample id confirmed for only {id_ok} of {n}; "
+                       f"samples are kept apart by {bio[0]['sample_label_source']}")
+        if exp_missing:
+            why.append("key experimental facts missing: " + ", ".join(exp_missing))
+        elif exp_conf != "confirmed":
+            why.append(f"key experimental facts are '{exp_conf}', not confirmed")
+        finish("pass_quantification_only:" + "; ".join(why) +
+               ". Per-sample matrices are supported; grouped comparisons are NOT.")
+        verdict_kind = "pass_quantification_only"
+    else:
+        finish("pass")
+        verdict_kind = "pass"
+
+    # ---- README ------------------------------------------------------------
+    write_readme(args, samples, bio, id_ok, grp_ok, scheme, key_exp, model_note,
+                 verdict_kind)
+    branches = collections.Counter(s["analysis_branch"] for s in samples)
+    log(f"{len(rows)} fastq -> {len(samples)} biological samples; branches={dict(branches)}")
+    return 0
+
+
+def write_readme(args, samples, bio, id_ok, grp_ok, scheme, key_exp, note, verdict):
+    n = len(bio)
+    lines = [
+        f"# {args.paper} - sample metadata", "",
+        f"Gate: **{verdict}**", "",
+        f"- FASTQ -> BioSample: {len(samples)} biological sample(s)"
+        f"{f', {len(samples) - n} technical control(s) flagged' if len(samples) != n else ''}",
+        f"- Samples kept apart by: {bio[0]['sample_label_source'] if bio else 'n/a'}",
+        f"- Paper's own sample id confirmed: {id_ok}/{n}",
+        f"- Experimental group confirmed: {grp_ok}/{n}",
+        f"- How it was resolved: {note}", "",
+        "## Sample id scheme", "",
+    ]
+    if scheme:
+        lines += [f"- {scheme.get('description', '')}",
+                  f"- confidence: **{scheme.get('confidence', 'unknown')}**",
+                  f"- evidence: {scheme.get('evidence', '')}"]
+    else:
+        lines.append("- not established in this run.")
+    lines += ["", "## Key experimental facts", ""]
+    if key_exp:
+        for k in ("host", "body_site", "design", "disease"):
+            lines.append(f"- {k}: {key_exp.get(k) or '(not established)'}")
+        lines += [f"- groups: {', '.join(key_exp.get('group_names') or []) or '(none established)'}",
+                  f"- confidence: **{key_exp.get('confidence', 'unknown')}**",
+                  f"- evidence: {key_exp.get('evidence', '')}"]
+    else:
+        lines.append("- not established in this run.")
+
+    # What an analysis can actually condition on, counted rather than claimed.
+    lines += ["", "## Per-sample fields resolved", "",
+              "Only `confirmed` values are counted; anything the session could "
+              "suggest but not confirm sits in `proposed_values` instead.", "",
+              "| field | confirmed | |", "| --- | --- | --- |"]
+    for f in CORE_FIELDS + EXTRA_FIELDS:
+        got = sum(1 for s in bio if s[f] not in (UNRESOLVED, NOT_REPORTED, ""))
+        tag = "**required**" if f in CORE_FIELDS else (
+            "usable" if got == n else ("partial" if got else "not reported"))
+        lines.append(f"| `{f}` | {got}/{n} | {tag} |")
+
+    lines += [
+        "", "## What this means", "",
+        {"pass": "Sample identity and the key experimental facts are established; "
+                 "grouped analysis is supported.",
+         "pass_quantification_only":
+             "Per-sample abundance may be produced, and the samples are distinct and "
+             "correctly separated. Group labels are NOT confirmed, so no case/control "
+             "or treatment comparison may be drawn from this paper yet.",
+         "blocked": "The core mapping could not be established. Step 3 will not run "
+                    "for this paper; other papers are unaffected."}[verdict],
+        "", "## Evidence and logs", "",
+        "- `sample_metadata.csv` - one row per biological sample. `metadata_confidence` "
+        "and `metadata_evidence` are per sample; anything the session suggested but "
+        "could not confirm is in `proposed_values` and is NOT treated as fact.",
+        "- `metadata_llm/prompt_sent.md` - the exact prompt used",
+        "- `metadata_llm/metadata_extraction.json` - the structured answer",
+        "- `metadata_llm/llm_session_*.jsonl` / `.err` - the session transcript",
+        "- `metadata_llm/llm_status.json` - agent, model, attempts, timings, and "
+        "recovery notes if it failed",
+        "",
+    ]
+    text = "\n".join(lines)
+    (args.out_dir / "README_metadata.md").write_text(text, encoding="utf-8")
+
+    # Append (never overwrite) a delimited section to the paper's own README.
+    paper_readme = args.integration_root / args.paper / "README.md"
+    if paper_readme.exists():
+        mark = "<!-- step2-metadata: generated, regenerated in place -->"
+        old = paper_readme.read_text(encoding="utf-8")
+        block = f"\n\n{mark}\n\n{text}"
+        if mark in old:
+            old = old[:old.index(mark)].rstrip()
+        paper_readme.write_text(old + block, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,438 @@
+#!/usr/bin/env Rscript
+#
+# DADA2 denoising for one paper. Called by step3_abundance.py, which has already
+# verified the primers and the amplicon length against the paper and passes them
+# in; nothing here is inferred from file names or hard-coded per paper.
+#
+# truncLen is CHOSEN FROM THE DATA, in three passes that all have to agree:
+#   A  expected-error profiles of both mates (how much of each read survives
+#      maxEE at each possible cut) - not a Q25 line, which says nothing about
+#      how many reads actually pass a filter
+#   B  the merge budget: a candidate is only considered if what is left after
+#      trimLeft still spans the measured amplicon with minOverlap to spare
+#   C  the real pipeline on a probe subset: filter -> denoise -> merge, scored
+#      on reads that survive all the way to a merged pair
+# --trunc-len overrides all of it (and is recorded as a manual override).
+#
+# Coordinates: truncLen is in RAW read bases. dada2::filterAndTrim truncates to
+# truncLen first and removes trimLeft afterwards, so the retained biological
+# length is truncLen - trimLeft. The merge budget below is written in the same
+# raw units, which is why trimLeft appears in it.
+
+suppressPackageStartupMessages({
+  library(dada2); library(Biostrings); library(ShortRead)
+})
+
+# ---- arguments -------------------------------------------------------------
+args <- commandArgs(trailingOnly = TRUE)
+getarg <- function(name, default = NULL) {
+  i <- match(name, args)
+  if (is.na(i) || i == length(args)) return(default)
+  args[[i + 1]]
+}
+int2 <- function(x) as.integer(strsplit(x, ",")[[1]])
+
+paper        <- getarg("--paper")
+reads_root   <- getarg("--reads-root")
+out_dir      <- getarg("--out-dir")
+region       <- getarg("--region", "unknown")
+trim_left    <- int2(getarg("--trim-left", "0,0"))
+max_trunc    <- int2(getarg("--max-trunc", "0,0"))
+insert_p99   <- as.integer(getarg("--insert-p99"))
+min_overlap  <- as.integer(getarg("--min-overlap", "12"))
+threads      <- as.integer(getarg("--threads", "4"))
+silva        <- getarg("--silva")
+silva_sp     <- getarg("--silva-species", NA)
+max_ee       <- as.numeric(int2(getarg("--max-ee", "2,5")))
+trunc_manual <- if (is.null(getarg("--trunc-len"))) NULL else int2(getarg("--trunc-len"))
+probe_n      <- as.integer(getarg("--probe-samples", "6"))   # pass B/C subset
+probe_reads  <- as.integer(getarg("--probe-reads", "40000"))
+only_probe   <- "--probe-only" %in% args        # validate before the full run
+min_reads    <- as.integer(getarg("--min-reads", "1000"))
+min_merge    <- as.numeric(getarg("--min-merge-frac", "0.30"))
+min_err_bases<- as.numeric(getarg("--min-error-bases", "1e8"))
+
+stopifnot(!is.null(paper), !is.null(out_dir), !is.na(insert_p99))
+dir.create(file.path(out_dir, "dada2"), recursive = TRUE, showWarnings = FALSE)
+res <- function(...) file.path(out_dir, "dada2", ...)
+say <- function(...) cat(sprintf(...), "\n", sep = "")
+fail <- function(...) { say("FAILED: ", sprintf(...)); quit(status = 1) }
+
+# ---- samples ---------------------------------------------------------------
+# samples_used.csv is written by step3_abundance.py with the technical controls
+# (blanks, dilution series) already removed, so they can never reach the matrix.
+sfile <- file.path(out_dir, "samples_used.csv")
+if (!file.exists(sfile)) fail("%s missing; run step 3 preflight first", sfile)
+meta <- read.csv(sfile, check.names = FALSE, fileEncoding = "UTF-8-BOM")
+say("%s: %d biological samples", paper, nrow(meta))
+
+fq_for <- function(runs, mate) {
+  unlist(lapply(strsplit(runs, ";")[[1]], function(r) {
+    d <- file.path(reads_root, paper, "raw_reads", r)
+    f <- list.files(d, pattern = sprintf("_%d\\.fastq\\.gz$", mate), full.names = TRUE)
+    if (!length(f)) f <- list.files(d, pattern = "\\.fastq\\.gz$", full.names = TRUE)
+    f
+  }))
+}
+fwd <- vapply(meta$run_accessions, function(r) fq_for(r, 1)[1], "")
+rev <- vapply(meta$run_accessions, function(r) fq_for(r, 2)[1], "")
+names(fwd) <- names(rev) <- meta$sample_id
+if (any(is.na(fwd) | fwd == "")) fail("no R1 found for: %s",
+                                      paste(meta$sample_id[fwd == ""], collapse = ", "))
+paired <- !any(is.na(rev) | rev == "")
+if (!paired) fail("this script is for paired reads; %s has unpaired files", paper)
+
+# ---- sequencing batches ----------------------------------------------------
+# A batch is a real flow cell, read out of the FASTQ header. Arbitrary groupings
+# of samples are NOT batches, so when the headers have been stripped (as SRA
+# often does) every sample goes into one model and that is said out loud.
+flowcell_of <- function(path) {
+  h <- as.character(ShortRead::id(ShortRead::readFastq(path))[1])
+  m <- regmatches(h, regexpr("[A-Za-z0-9_-]+:[0-9]+:[A-Za-z0-9-]+:[0-9]+:", h))
+  if (!length(m)) return(NA_character_)
+  paste(strsplit(m, ":")[[1]][1:3], collapse = ":")
+}
+batch <- vapply(fwd, function(f) tryCatch(flowcell_of(f), error = function(e) NA_character_), "")
+if (anyNA(batch)) {
+  say("batch: FASTQ headers carry no instrument/run/flow-cell id (stripped on submission).")
+  say("       Using ONE error model for all samples - inventing batches from sample")
+  say("       names would be worse than admitting the batch structure is unknown.")
+  batch[] <- "unknown_single_model"
+} else {
+  say("batch: %d flow cell(s) found in the read headers: %s", length(unique(batch)),
+      paste(sprintf("%s (n=%d)", names(table(batch)), table(batch)), collapse = ", "))
+}
+meta$sequencing_batch <- batch
+
+# ---- pass A: expected-error profiles ---------------------------------------
+# For each possible cut, how many reads would survive maxEE? Computed exactly
+# from the quality strings rather than read off a median-quality curve.
+ee_profile <- function(files, n = 40000) {
+  cum <- NULL; tot <- 0
+  for (f in files) {
+    fq <- ShortRead::yield(ShortRead::FastqStreamer(f, n))
+    q <- as(Biostrings::quality(fq), "matrix")
+    # A read shorter than the cut is DISCARDED by filterAndTrim, so its missing
+    # tail must score as a failure. Leaving it as 0 error would make an
+    # over-long truncLen look like the best option on a run of mixed lengths.
+    p <- 10^(-q / 10); p[is.na(p)] <- Inf
+    ee <- t(apply(p, 1, cumsum))
+    if (!is.null(cum)) {                       # runs may differ in read length
+      w <- min(ncol(cum), ncol(ee))
+      cum <- rbind(cum[, seq_len(w), drop = FALSE], ee[, seq_len(w), drop = FALSE])
+    } else cum <- ee
+    tot <- tot + nrow(ee)
+    if (tot >= n) break
+  }
+  cum
+}
+set.seed(1)
+# Spread the probe over the flow cells rather than over the sample list, so the
+# chosen truncLen is not tuned to whichever run happens to sort first.
+probe_ids <- unlist(lapply(split(meta$sample_id, meta$sequencing_batch), function(ids)
+  ids[round(seq(1, length(ids), length.out = max(1, round(probe_n * length(ids) / nrow(meta)))))]))
+probe_ids <- unique(probe_ids)
+say("probe subset (%d samples over %d batch(es)): %s", length(probe_ids),
+    length(unique(meta$sequencing_batch[match(probe_ids, meta$sample_id)])),
+    paste(probe_ids, collapse = ", "))
+
+eeF <- ee_profile(fwd[probe_ids], probe_reads)
+eeR <- ee_profile(rev[probe_ids], probe_reads)
+pass_at <- function(ee, L, cap) if (L > ncol(ee)) NA else mean(ee[, L] <= cap)
+readlen <- c(ncol(eeF), ncol(eeR))
+cap <- pmin(max_trunc, readlen)
+say("read length %d/%d; truncLen capped at %d/%d", readlen[1], readlen[2], cap[1], cap[2])
+
+# ---- pass B: candidates that can still merge -------------------------------
+need <- insert_p99 + min_overlap + sum(trim_left)
+say("merge budget: truncLen[1]+truncLen[2] >= %d (insert p99 %d + overlap %d + trimLeft %d+%d)",
+    need, insert_p99, min_overlap, trim_left[1], trim_left[2])
+if (sum(cap) < need) fail("reads are too short: best possible sum %d < required %d",
+                          sum(cap), need)
+
+grid <- expand.grid(f = seq(cap[1], max(trim_left[1] + 50, cap[1] - 80), by = -10),
+                    r = seq(cap[2], max(trim_left[2] + 50, cap[2] - 100), by = -10))
+grid <- grid[grid$f + grid$r >= need, ]
+grid$keepF <- vapply(grid$f, function(L) pass_at(eeF, L, max_ee[1]), 0)
+grid$keepR <- vapply(grid$r, function(L) pass_at(eeR, L, max_ee[2]), 0)
+grid$keep  <- grid$keepF * grid$keepR          # both mates must survive
+grid$slack <- grid$f + grid$r - need
+grid <- grid[order(-grid$keep, -grid$slack), ]
+write.csv(grid, res("trunclen_pass_a_b.csv"), row.names = FALSE)
+say("pass A/B: %d admissible candidates; best estimated filter retention %.1f%%",
+    nrow(grid), 100 * grid$keep[1])
+
+cands <- grid[seq_len(min(5, nrow(grid))), c("f", "r")]
+# Keep one deliberately short-and-clean and one long-and-permissive candidate so
+# pass C is choosing between real alternatives, not re-ranking near-identical ones.
+cands <- unique(rbind(cands, grid[nrow(grid), c("f", "r")]))
+
+# ---- pass C: the real pipeline on the probe subset -------------------------
+tmp <- file.path(tempdir(), "probe"); dir.create(tmp, showWarnings = FALSE)
+score_candidate <- function(f, r) {
+  ff <- file.path(tmp, paste0(probe_ids, "_F.fq.gz"))
+  rr <- file.path(tmp, paste0(probe_ids, "_R.fq.gz"))
+  ft <- tryCatch(filterAndTrim(fwd[probe_ids], ff, rev[probe_ids], rr,
+                               truncLen = c(f, r), trimLeft = trim_left,
+                               maxEE = max_ee, truncQ = 2, maxN = 0, rm.phix = TRUE,
+                               compress = TRUE, multithread = threads, verbose = FALSE),
+                 error = function(e) NULL)
+  if (is.null(ft) || !any(file.exists(ff))) return(c(filt = 0, merged = 0))
+  ok <- file.exists(ff) & file.exists(rr)
+  eF <- learnErrors(ff[ok], multithread = threads, verbose = FALSE)
+  eR <- learnErrors(rr[ok], multithread = threads, verbose = FALSE)
+  dF <- dada(ff[ok], err = eF, multithread = threads, verbose = FALSE)
+  dR <- dada(rr[ok], err = eR, multithread = threads, verbose = FALSE)
+  mg <- mergePairs(dF, ff[ok], dR, rr[ok], minOverlap = min_overlap,
+                   maxMismatch = 0, verbose = FALSE)
+  nin <- sum(ft[, "reads.in"]); nmg <- sum(vapply(mg, function(m) sum(m$abundance), 0))
+  unlink(c(ff, rr))
+  c(filt = sum(ft[, "reads.out"]) / max(nin, 1), merged = nmg / max(nin, 1))
+}
+
+if (!is.null(trunc_manual)) {
+  trunc_len <- trunc_manual
+  basis <- sprintf("MANUAL OVERRIDE via --trunc-len %d,%d", trunc_len[1], trunc_len[2])
+  if (sum(trunc_len) < need)
+    say("WARNING: the manual truncLen sum %d is below the merge budget %d.",
+        sum(trunc_len), need)
+  scores <- NULL
+} else {
+  say("pass C: running filter -> denoise -> merge on the probe subset for %d candidates",
+      nrow(cands))
+  scores <- do.call(rbind, lapply(seq_len(nrow(cands)), function(i) {
+    s <- score_candidate(cands$f[i], cands$r[i])
+    say("  truncLen c(%d,%d): %.1f%% pass the filter, %.1f%% reach a merged pair",
+        cands$f[i], cands$r[i], 100 * s["filt"], 100 * s["merged"])
+    data.frame(f = cands$f[i], r = cands$r[i], filt = s["filt"], merged = s["merged"])
+  }))
+  scores <- scores[order(-scores$merged, -(scores$f + scores$r)), ]
+  write.csv(scores, res("trunclen_pass_c.csv"), row.names = FALSE)
+  if (scores$merged[1] <= 0) fail("no candidate truncLen merged any reads")
+  trunc_len <- c(scores$f[1], scores$r[1])
+  basis <- sprintf(paste("chosen by merged-read retention on %d probe samples:",
+                         "%.1f%% of raw reads reach a merged pair (%.1f%% pass the filter)"),
+                   length(probe_ids), 100 * scores$merged[1], 100 * scores$filt[1])
+}
+say("truncLen = c(%d, %d)  [%s]", trunc_len[1], trunc_len[2], basis)
+if (only_probe) {
+  writeLines(c(sprintf("truncLen\t%d,%d", trunc_len[1], trunc_len[2]), basis),
+             res("trunclen_choice.txt"))
+  say("--probe-only: stopping after validation, nothing was run on the full set.")
+  quit(status = 0)
+}
+
+# ---- filter all samples ----------------------------------------------------
+fdir <- file.path(out_dir, "dada2", "filtered"); dir.create(fdir, showWarnings = FALSE)
+filtF <- file.path(fdir, paste0(meta$sample_id, "_F.fq.gz"))
+filtR <- file.path(fdir, paste0(meta$sample_id, "_R.fq.gz"))
+ft <- filterAndTrim(fwd, filtF, rev, filtR, truncLen = trunc_len, trimLeft = trim_left,
+                    maxEE = max_ee, truncQ = 2, maxN = 0, rm.phix = TRUE,
+                    compress = TRUE, multithread = threads, verbose = FALSE)
+rownames(ft) <- meta$sample_id
+kept <- file.exists(filtF) & file.exists(filtR) & ft[, "reads.out"] >= min_reads
+if (!any(kept)) fail("every sample fell below %d reads after filtering", min_reads)
+if (any(!kept)) say(paste("%d sample(s) below %d reads after filtering, carried into",
+                          "the report as empty rather than silently dropped: %s"),
+                    sum(!kept), min_reads, paste(meta$sample_id[!kept], collapse = ", "))
+
+# ---- error models, per real batch -----------------------------------------
+# A batch with too little data gives a worse model than the pooled one, so small
+# batches are pooled and the decision is recorded per sample.
+bat <- meta$sequencing_batch[kept]
+bases <- tapply(ft[kept, "reads.out"], bat, sum) * (trunc_len[1] - trim_left[1])
+big <- names(bases)[bases >= min_err_bases]
+model_of <- ifelse(bat %in% big, bat, "pooled_small_batches")
+if (length(unique(model_of)) < length(unique(bat)))
+  say("error models: %s have enough data for their own model; the rest are pooled",
+      paste(big, collapse = ", "))
+errF <- errR <- list()
+for (b in unique(model_of)) {
+  i <- which(model_of == b)
+  errF[[b]] <- learnErrors(filtF[kept][i], multithread = threads, verbose = FALSE)
+  errR[[b]] <- learnErrors(filtR[kept][i], multithread = threads, verbose = FALSE)
+  say("error model %s: %d samples", b, length(i))
+}
+pdf(res("error_models.pdf")); for (b in names(errF)) {
+  print(plotErrors(errF[[b]], nominalQ = TRUE) + ggplot2::ggtitle(paste("R1", b)))
+  print(plotErrors(errR[[b]], nominalQ = TRUE) + ggplot2::ggtitle(paste("R2", b)))
+}; invisible(dev.off())
+
+# ---- denoise and merge -----------------------------------------------------
+# pool = "pseudo": sensitivity close to full pooling for variants that are rare
+# in any one sample but present across the study, without full pooling's cost.
+dadaF <- dadaR <- mergers <- list()
+for (b in unique(model_of)) {
+  i <- which(model_of == b)
+  dF <- dada(filtF[kept][i], err = errF[[b]], pool = "pseudo",
+             multithread = threads, verbose = FALSE)
+  dR <- dada(filtR[kept][i], err = errR[[b]], pool = "pseudo",
+             multithread = threads, verbose = FALSE)
+  if (length(i) == 1) { dF <- list(dF); dR <- list(dR) }
+  mg <- mergePairs(dF, filtF[kept][i], dR, filtR[kept][i],
+                   minOverlap = min_overlap, maxMismatch = 0, verbose = FALSE)
+  if (length(i) == 1) mg <- list(mg)
+  ids <- meta$sample_id[kept][i]
+  names(dF) <- names(dR) <- names(mg) <- ids
+  dadaF[ids] <- dF; dadaR[ids] <- dR; mergers[ids] <- mg
+}
+
+seqtab <- makeSequenceTable(mergers)
+say("%d ASVs before length filtering and chimera removal", ncol(seqtab))
+
+# ---- length filter ---------------------------------------------------------
+# Keyed to the amplicon length MEASURED from these reads, with a tolerance wide
+# enough for real taxon-to-taxon variation; everything dropped is written out.
+lens <- nchar(colnames(seqtab))
+lo <- insert_p99 - 60; hi <- insert_p99 + 20
+in_range <- lens >= lo & lens <= hi
+say("length filter: keeping ASVs of %d-%d bp (%d of %d ASVs, %.2f%% of reads)",
+    lo, hi, sum(in_range), length(lens), 100 * sum(seqtab[, in_range]) / sum(seqtab))
+write.csv(data.frame(length = as.integer(names(table(lens))),
+                     n_asvs = as.integer(table(lens)),
+                     reads = tapply(colSums(seqtab), lens, sum),
+                     kept = as.integer(names(table(lens))) >= lo &
+                            as.integer(names(table(lens))) <= hi),
+          res("asv_length_distribution.csv"), row.names = FALSE)
+seqtab <- seqtab[, in_range, drop = FALSE]
+
+# ---- chimeras --------------------------------------------------------------
+# "consensus" calls a sequence chimeric only when it is flagged in a majority of
+# the samples it appears in, so a single odd sample cannot remove a real ASV.
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus",
+                                    multithread = threads, verbose = FALSE)
+say("chimera removal: %d of %d ASVs kept, %.1f%% of reads retained",
+    ncol(seqtab.nochim), ncol(seqtab), 100 * sum(seqtab.nochim) / sum(seqtab))
+
+# ---- per-sample, per-step read counts --------------------------------------
+getn <- function(x) vapply(x, function(y) sum(getUniques(y)), 0)
+ids <- rownames(seqtab.nochim)
+track <- data.frame(
+  sample_id   = meta$sample_id,
+  raw         = ft[, "reads.in"],
+  filtered    = ft[, "reads.out"],
+  denoised_f  = getn(dadaF)[meta$sample_id],
+  denoised_r  = getn(dadaR)[meta$sample_id],
+  merged      = getn(mergers)[meta$sample_id],
+  nonchimeric = rowSums(seqtab.nochim)[match(meta$sample_id, ids)],
+  sequencing_batch = meta$sequencing_batch,
+  error_model = model_of[match(meta$sample_id, meta$sample_id[kept])],
+  row.names = NULL)
+track[is.na(track)] <- 0
+track$retention_filtered   <- track$filtered    / pmax(track$raw, 1)
+track$retention_merged     <- track$merged      / pmax(track$filtered, 1)
+track$retention_overall    <- track$nonchimeric / pmax(track$raw, 1)
+write.csv(track, res("read_counts_per_step.csv"), row.names = FALSE)
+
+# ---- hard failures ---------------------------------------------------------
+# An empty or collapsing merge is a result about the data, never something to
+# paper over with a looser parameter.
+empty <- track$sample_id[track$raw >= min_reads & track$nonchimeric == 0]
+weak  <- track$sample_id[track$filtered >= min_reads & track$retention_merged < min_merge]
+med   <- median(track$retention_merged[track$filtered >= min_reads])
+say("merge retention: median %.1f%%, %d sample(s) below %.0f%%, %d sample(s) empty",
+    100 * med, length(weak), 100 * min_merge, length(empty))
+if (length(empty) || med < min_merge) {
+  writeLines(c(sprintf("empty after merging: %s", paste(empty, collapse = ", ")),
+               sprintf("below %.0f%% merge retention: %s", 100 * min_merge,
+                       paste(weak, collapse = ", ")),
+               sprintf("median merge retention: %.3f", med)),
+             res("MERGE_FAILURE.txt"))
+  fail(paste("merging is anomalous (median retention %.1f%%, %d empty samples).",
+             "Counts are in read_counts_per_step.csv; see MERGE_FAILURE.txt.",
+             "Do NOT relax minOverlap to make this pass - check the amplicon",
+             "length and the truncLen choice first."), 100 * med, length(empty))
+}
+
+# ---- taxonomy --------------------------------------------------------------
+taxa <- assignTaxonomy(seqtab.nochim, silva, multithread = threads,
+                       minBoot = 50, tryRC = TRUE)
+if (!is.na(silva_sp) && file.exists(silva_sp))
+  taxa <- addSpecies(taxa, silva_sp)      # exact match only; never an alignment
+
+# ---- outputs ---------------------------------------------------------------
+asv_id <- sprintf("ASV%04d", seq_len(ncol(seqtab.nochim)))
+seqs <- colnames(seqtab.nochim)
+writeXStringSet(setNames(DNAStringSet(seqs), asv_id), res("asv_sequences.fasta"))
+
+# One row per SAMPLE, one column per ASV - the orientation the rest of the
+# database uses, and the one every R/Python stats package expects.
+counts <- seqtab.nochim
+colnames(counts) <- asv_id
+write.csv(data.frame(sample_id = rownames(counts), counts, check.names = FALSE),
+          res("asv_counts.csv"), row.names = FALSE)
+
+# Relative abundance: each sample's counts divided by that SAMPLE's own total of
+# the ASVs in this table (post length-filter, post-chimera). It is not divided
+# by raw reads, so each ROW sums to exactly 1 and samples remain comparable;
+# what each sample lost on the way is in read_counts_per_step.csv.
+denom <- rowSums(counts)
+rel <- sweep(counts, 1, pmax(denom, 1), "/")
+write.csv(data.frame(sample_id = rownames(rel), rel, check.names = FALSE),
+          res("asv_relative_abundance.csv"), row.names = FALSE)
+
+# The count table as an R object, so the output stage can be redone without
+# repeating the denoising run.
+saveRDS(list(seqtab = seqtab.nochim, asv_id = asv_id, taxa = taxa),
+        res("seqtab_nochim.rds"))
+
+write.csv(data.frame(asv_id, sequence = seqs, length = nchar(seqs),
+                     as.data.frame(taxa, stringsAsFactors = FALSE), row.names = NULL),
+          res("asv_taxonomy.csv"), row.names = FALSE)
+
+meta$reads_in_matrix <- denom[match(meta$sample_id, rownames(counts))]
+meta$reads_in_matrix[is.na(meta$reads_in_matrix)] <- 0
+write.csv(meta, res("sample_metadata.csv"), row.names = FALSE)
+
+writeLines(c(
+  sprintf("paper: %s", paper),
+  sprintf("region: %s", region),
+  sprintf("samples: %d biological samples, %d with reads in the matrix",
+          nrow(meta), sum(meta$reads_in_matrix > 0)),
+  sprintf("ASVs: %d", ncol(seqtab.nochim)),
+  "",
+  "parameters, and why:",
+  sprintf("  trimLeft   = c(%d, %d)   primer lengths from the paper (0 = reads arrived pre-trimmed)",
+          trim_left[1], trim_left[2]),
+  sprintf("  truncLen   = c(%d, %d)   %s", trunc_len[1], trunc_len[2], basis),
+  "  truncLen is in RAW read bases; filterAndTrim truncates before removing trimLeft,",
+  sprintf("  so the retained biological length is %d / %d bp.",
+          trunc_len[1] - trim_left[1], trunc_len[2] - trim_left[2]),
+  sprintf("  merge budget: %d + %d = %d >= %d (insert p99 %d + overlap %d + trimLeft %d)",
+          trunc_len[1], trunc_len[2], sum(trunc_len), need, insert_p99, min_overlap,
+          sum(trim_left)),
+  sprintf("  maxEE      = c(%g, %g)   R2 is allowed more error than R1 because the",
+          max_ee[1], max_ee[2]),
+  "               second mate is always the worse read; a single strict cutoff",
+  "               would discard good pairs for R2's tail alone.",
+  "  pool       = \"pseudo\"   recovers variants that are rare in any one sample",
+  "               but present across the study, at a fraction of full pooling's cost.",
+  sprintf("  error models: %d, one per sequencing batch with >= %.0e bases; smaller",
+          length(unique(model_of)), min_err_bases),
+  "               batches are pooled. Batches come from the flow-cell id in the",
+  "               FASTQ headers, never from sample names.",
+  "  chimeras   = removeBimeraDenovo(method = \"consensus\")   a sequence is removed",
+  "               only if flagged in most of the samples it appears in.",
+  "",
+  "filters applied, in order:",
+  sprintf("  1. maxN = 0, truncQ = 2, rm.phix = TRUE, maxEE = c(%g, %g)", max_ee[1], max_ee[2]),
+  sprintf("  2. samples under %d reads after filtering are reported with zero counts", min_reads),
+  sprintf("  3. ASVs outside %d-%d bp dropped (measured amplicon length +/- real variation)", lo, hi),
+  "  4. consensus chimera removal",
+  "",
+  "table orientation:",
+  "  one ROW per sample, one COLUMN per ASV, first column sample_id.",
+  "",
+  "relative abundance denominator:",
+  "  each sample's own total over the ASVs in asv_counts.csv (after the length",
+  "  filter and chimera removal). Each ROW sums to 1. NOT raw reads: per-step",
+  "  losses are in read_counts_per_step.csv.",
+  "",
+  "files: asv_counts.csv, asv_relative_abundance.csv, asv_sequences.fasta,",
+  "       seqtab_nochim.rds,",
+  "       asv_taxonomy.csv, sample_metadata.csv, read_counts_per_step.csv,",
+  "       asv_length_distribution.csv, trunclen_pass_a_b.csv, trunclen_pass_c.csv,",
+  "       error_models.pdf"
+), res("README.txt"))
+
+say("done: %d ASVs x %d samples -> %s", ncol(seqtab.nochim), nrow(seqtab.nochim), res(""))

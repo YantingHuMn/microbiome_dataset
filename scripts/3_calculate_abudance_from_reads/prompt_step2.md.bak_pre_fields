@@ -1,0 +1,120 @@
+You are resolving the sample metadata for ONE paper whose raw reads have already
+been downloaded. You are running unattended — no human will answer questions, so
+decide yourself, and where the evidence does not support a conclusion, say so
+instead of guessing. A wrong label is far worse here than an admitted gap.
+
+## Your paper
+- Folder: {PAPER}
+- DOI: {DOI}  (https://doi.org/{DOI})
+- Title: {TITLE}
+- Downloaded reads (READ ONLY, do not modify or delete): {READS_DIR}
+- Original/supplementary files already on disk, if any (READ ONLY): {ORIG_DIR}
+- Working dir for this task (write ONLY here): {WORK_DIR}
+- Write your structured answer to exactly this path: {OUT_JSON}
+
+## What already exists (inputs, not answers)
+- `{WORK_DIR}/ena_runs.tsv` — every run this paper's FASTQs came from, with the
+  ENA fields already retrieved: run, experiment, BioSample, study, library
+  strategy/source/selection/layout, instrument, read count, scientific_name,
+  host, isolation_source, sample_title, sample_alias.
+- `{PAPER_FACTS}` — a human-curated facts file, if one exists. It is EVIDENCE
+  you may cite and build on. It does NOT replace your own check: confirm its
+  claims against the paper, and report anything it gets wrong or omits.
+
+## The chain you must resolve
+Knowing a BioSample accession is NOT knowing what the sample is. Resolve the
+whole chain and say where each link came from:
+
+    FASTQ file -> run (SRR/ERR/DRR) -> experiment -> BioSample
+              -> the sample identifier used IN THE PAPER
+              -> experimental group / subject / tissue or body site / timepoint
+
+The last two links are the ones that matter and the ones that are usually
+missing from ENA. Look for them in, roughly this order:
+
+1. the ENA/SRA sample attributes already in `ena_runs.tsv` (aliases and titles
+   often encode group, subject, site or day)
+2. the paper's Methods, figures, and figure legends
+3. the supplementary material — tables of sample IDs, mapping files, metadata
+   sheets. Download them if they are openly available.
+4. the authors' code or data repository (GitHub/Zenodo/OSF/figshare) — mapping
+   files and QIIME/phyloseq metadata files live there surprisingly often
+5. the BioProject/BioSample records at NCBI, which sometimes carry attributes
+   that the ENA mirror does not expose
+
+Europe PMC usually has the open-access full text and the supplementary files:
+  https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:%22{DOI}%22&format=json&resultType=core
+  https://www.ebi.ac.uk/europepmc/webservices/rest/PMC<id>/fullTextXML
+  https://www.ebi.ac.uk/europepmc/webservices/rest/PMC<id>/supplementaryFiles
+
+## Rules
+- **Never invent a group label.** If you cannot tell which samples are cases and
+  which are controls, that is the finding. Report it.
+- **Separate what you confirmed from what you suspect.** Confidence is recorded
+  **per field**, not per sample: the sample id can be certain while the group is
+  only a guess, and that must be visible. Each field carries its own
+  `confidence`:
+  - `confirmed` — a specific document states it, and you cite where
+  - `inferred` — a consistent, stated reasoning step from evidence (e.g. an
+    alias pattern that a figure legend defines); say what the reasoning was
+  - `unknown` — you could not establish it. Leave the value empty.
+  Only `confirmed` will be treated downstream as fact.
+- A sample count that matches the paper's N is supporting evidence, never on its
+  own a mapping. "63 runs and the paper says 25+38" does not tell you which run
+  is which.
+- Mark extraction blanks, buffer controls, mock communities, dilution series and
+  positive controls with `is_technical_control: true`. They are not biological
+  samples.
+- Do not modify anything under {READS_DIR} or {ORIG_DIR}.
+- Do not download sequencing data. Supplementary tables and metadata files only.
+
+## Output — write this JSON to {OUT_JSON} and nothing else to that path
+
+```json
+{
+  "paper_folder": "{PAPER}",
+  "doi": "{DOI}",
+  "sample_id_scheme": {
+    "description": "how the ENA alias/title maps to the paper's own sample ids, or why it cannot be mapped",
+    "confidence": "confirmed|inferred|unknown",
+    "evidence": "exact source: document, table/figure number, URL, file path"
+  },
+  "key_experiment": {
+    "host": "", "body_site": "", "design": "", "disease": "",
+    "group_names": [], "n_groups": 0,
+    "confidence": "confirmed|inferred|unknown",
+    "evidence": ""
+  },
+  "samples": [
+    {
+      "biosample_accession": "SAMN...",
+      "run_accessions": ["SRR..."],
+      "is_technical_control": false,
+      "fields": {
+        "paper_sample_id":    {"value": "", "confidence": "confirmed|inferred|unknown", "evidence": ""},
+        "experimental_group": {"value": "", "confidence": "confirmed|inferred|unknown", "evidence": ""},
+        "subject_id":         {"value": "", "confidence": "confirmed|inferred|unknown", "evidence": ""},
+        "tissue":             {"value": "", "confidence": "confirmed|inferred|unknown", "evidence": ""},
+        "timepoint":          {"value": "", "confidence": "confirmed|inferred|unknown", "evidence": ""}
+      }
+    }
+  ],
+  "unresolved": ["each thing you could not establish, and what would resolve it"],
+  "sources_consulted": [
+    {"type": "paper|supplementary|repository|ena|ncbi|other", "locator": "URL or path", "useful": true}
+  ],
+  "summary": "3-6 sentences: what is now known, what is not, and what the paper can and cannot be used for"
+}
+```
+
+Give all five `fields` for every sample, using `"confidence": "unknown"` with an
+empty value for the ones you could not establish. `paper_sample_id` and
+`experimental_group` are the two that decide what the paper can be used for.
+
+Include one entry in `samples` for every BioSample in `ena_runs.tsv`, even the
+ones you could not resolve — an omitted sample is indistinguishable from an
+overlooked one. `sources_consulted` must list what you actually opened,
+including sources that turned out to be useless.
+
+Write the JSON file, then reply with a short plain-text summary. Do not print
+the JSON in your reply.

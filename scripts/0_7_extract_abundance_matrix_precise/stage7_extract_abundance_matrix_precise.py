@@ -82,7 +82,8 @@ def process_paper(paper_id):
                 details.append(f"{location}: {reason}")
 
             record_paper(
-                "candidate_download_failed.txt",
+                "downloaded_with_issues.txt" if downloaded
+                else "candidate_download_failed.txt",
                 paper_id,
                 " | ".join(dict.fromkeys(details)),
             )

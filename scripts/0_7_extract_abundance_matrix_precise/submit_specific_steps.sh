@@ -17,7 +17,7 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
 
 export PYTHONUNBUFFERED=1
 # module purge
-# module add r/4.4.0
+# module add r/4.6.0
 # module load seurat/5.3.0-R4.4.0
 
 if [ -d /nas/sycamore/home/yanting/.conda/envs/virus_syca ]; then

@@ -188,6 +188,10 @@ def find_data_sources(paper_id, timeout=30):
             return "DDBJ"
         if host == "ngdc.cncb.ac.cn":
             return "NGDC GSA"
+        if host == "db.cngb.org":
+            return "CNGBdb"
+        if host == "nmdc.cn" or host.endswith(".nmdc.cn"):
+            return "NMDC"
         return "unknown"
 
     result = []
@@ -236,15 +240,30 @@ def find_data_sources(paper_id, timeout=30):
             match = re.search(
                 accession_pattern, urllib.parse.unquote(value), re.I
             )
-            if not match:
+            is_url = re.match(r"https?://", value, re.I)
+            if not match and not is_url:
                 raise ValueError(f"Raw reads accession not identified: {value}")
 
-            accession = match.group().upper()
+            # Archive record URLs may carry IDs outside accession_pattern
+            accession = match.group().upper() if match else None
 
-            if not re.match(r"https?://", value, re.I):
+            if not is_url:
                 link = raw_reads_link(accession, platform)
 
-        key = (kind, platform, accession if kind == "raw_reads" else link)
+        # Skip site homepages / generic database pages cited with "accessed on"
+        if re.match(r"https?://", value, re.I):
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.path in {"", "/"} and not parsed.query:
+                return
+            if (
+                platform in {
+                    "NCBI", "EMBL-EBI", "DDBJ", "NGDC GSA", "CNGBdb", "NMDC",
+                }
+                and not re.search(r"\d", parsed.path + parsed.query)
+            ):
+                return
+
+        key = (kind, platform, accession or link)
 
         if key not in seen:
             seen.add(key)
@@ -443,12 +462,23 @@ def find_data_sources(paper_id, timeout=30):
 
             for url in urls:
                 platform = platform_for(url)
+                # Sequence-archive record pages hold raw sequences, not tables;
+                # GEO / MGnify are excluded since they can host processed data
                 if (
-                    platform == "NCBI"
-                    and has_sra
-                    and re.search(accession_pattern, urllib.parse.unquote(url), re.I)
+                    platform in {
+                        "NCBI", "EMBL-EBI", "DDBJ", "NGDC GSA", "CNGBdb", "NMDC",
+                    }
+                    and not re.search(r"/geo/|/metagenomics/", url, re.I)
                 ):
-                    add("raw_reads", "NCBI SRA", url, source_section)
+                    if re.search(
+                        accession_pattern, urllib.parse.unquote(url), re.I
+                    ):
+                        platform = {
+                            "NCBI": "NCBI SRA",
+                            "EMBL-EBI": "ENA",
+                            "DDBJ": "DDBJ DRA",
+                        }.get(platform, platform)
+                    add("raw_reads", platform, url, source_section)
                     raw_urls.append(url)
                 else:
                     add("link", platform, url, source_section)

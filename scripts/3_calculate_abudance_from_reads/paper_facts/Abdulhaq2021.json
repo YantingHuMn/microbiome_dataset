@@ -1,0 +1,93 @@
+{
+  "paper_folder": "Abdulhaq2021",
+  "doi": "10.1080/20002297.2021.1936434",
+  "verified_on": "2026-10-22",
+  "sources": [
+    "Full text: PMC8221129 (J Oral Microbiol 13:1936434), '16S sequencing and bioinformatic analysis'",
+    "Primer sequences come from the two papers it cites: Frank et al. 2008 AEM 74:2461 (27F-YM) and Lane et al. 1985 PNAS 82:6955 (519R)"
+  ],
+  "amplicon": {
+    "status": "verified",
+    "region": "16S_V1V3",
+    "paper_statement": "the V1-3 region was amplified using the degenerate primers 27FYM [Frank 2008] and 519R [Lane 1985] and the generated amplicons (~520 bp) were purified and tagged with 8-base barcodes; MiSeq, Illumina V3 2 x 300 bp chemistry.",
+    "forward_primer": {
+      "name": "27F-YM",
+      "seq": "AGAGTTTGATYMTGGCTCAG",
+      "length": 20
+    },
+    "reverse_primer": {
+      "name": "519R",
+      "seq": "GWATTACCGCGGCKGCTG",
+      "length": 18
+    },
+    "primers_in_reads": true,
+    "primer_evidence": "The paper names the primers by citation rather than printing them, so the cited sequences were checked against the reads instead of trusted: forward matches 93-95% of R1 and reverse 97-98% of R2 over 3 runs x 3000 reads (<=2 mismatches, IUPAC expanded). The dominant 5' 10-mer of R1 is AGAGTTTGAT in 94-96% of reads.",
+    "read_length": [
+      301,
+      301
+    ],
+    "trim_left": [
+      20,
+      18
+    ],
+    "insert_length_primer_free": {
+      "method": "measured by R1 vs revcomp(R2) overlap alignment over 2624 read pairs from 5 runs",
+      "min": 274,
+      "p1": 345,
+      "p5": 456,
+      "median": 491,
+      "p95": 511,
+      "p99": 511,
+      "max": 511,
+      "modes": [
+        491,
+        498,
+        511,
+        493,
+        496
+      ],
+      "note": "Consistent with the paper's '~520 bp' amplicon (520 - 20 - 18 = 482 primer-free). V1-V3 length varies more across taxa than V3-V4 does, hence the long left tail."
+    },
+    "trunc_len_basis": "RAW read coordinates, same convention as every other paper here (truncLen applies before trimLeft in dada2::filterAndTrim).",
+    "merge_budget": {
+      "min_overlap": 12,
+      "required_raw_sum": 561,
+      "formula": "truncLen[1] + truncLen[2] >= 511 + 12 + 20 + 18",
+      "available_raw_sum": 602,
+      "slack": 41,
+      "warning": "Only 41 bp of slack. V1-V3 on 2 x 300 is marginal by construction: R2 must stay long exactly where its quality is worst. truncLen must therefore be chosen on merge success and retention, not on a quality curve, and a low merge rate here is a real result about the data rather than a parameter to force."
+    },
+    "read_through": "3.6% of R1 reads hit revcomp(519R) early (median 158 bp). These are short non-specific products, not the main amplicon; they are dropped naturally because they will not merge at the expected length.",
+    "max_trunc_len": [
+      301,
+      301
+    ],
+    "max_trunc_len_reason": "read length; no 3' read-through to avoid"
+  },
+  "sample_identity": {
+    "status": "unresolved",
+    "n_biological_samples": 63,
+    "n_runs": 63,
+    "runs_per_sample": "1",
+    "technical_controls_in_run_set": "none declared",
+    "decodable_from_alias": {},
+    "group_assignment": {
+      "status": "unresolved",
+      "reason": "ENA aliases are A1-A63 with no title, isolation_source or attribute that separates case from control. The paper reports 25 children with ASD and 38 neurotypical controls, which sums to the 63 runs, but nothing published maps a given A<n> to a group.",
+      "action": "This is the paper's blocking issue, NOT its primers. ASV tables may be produced, but the ASD/control contrast cannot be reconstructed, so the paper stays unusable for case/control analysis until the authors supply the key. Do not infer the split from A-number ordering."
+    },
+    "usable_for": [
+      "ASV / relative-abundance tables only"
+    ],
+    "not_usable_for": [
+      "the ASD vs neurotypical contrast, i.e. the paper's entire point: no published key maps A1-A63 to a group"
+    ],
+    "exclude_alias_prefixes": []
+  },
+  "experiment": {
+    "host": "Homo sapiens",
+    "body_site": "tongue dorsum (tongue scrapings)",
+    "design": "case-control: 25 children with autism spectrum disorder vs 38 neurotypical controls",
+    "disease": "autism spectrum disorder"
+  }
+}

@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Step 3: branch by assay type and produce count + relative abundance.
+
+Branches are decided from sample_metadata.csv written by step 2, never guessed
+from file names. Each branch is separate on disk; nothing is concatenated across
+branches here - cross-paper merging is a later, explicit step.
+
+    amplicon      region measured from the reads, then DADA2 (step3_16s.R)
+    dna_shotgun   needs tools that are NOT installed yet; preflight reports this
+    rna           kept separate, labelled as RNA-level; not implemented yet
+
+Primers, amplicon length and sample identity are NOT guessed. They are read
+from paper_facts/<paper>.json, which records what the paper itself says and how
+it was checked against the reads. Step 3 re-measures the primers in the reads
+and refuses to run if they disagree with the file. A confirmed primer never
+excuses an unchecked sample identity: both sections are gated separately.
+
+--preflight checks inputs, tools and disk and writes analysis_plan.json without
+running anything. Run it first.
+"""
+
+import argparse
+import collections
+import csv
+import gzip
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+# 5' primer prefixes. Degenerate bases are expanded so a short literal prefix is
+# never the whole basis for a call: a region is only accepted when the forward
+# primer is seen in most reads AND (for paired data) the reverse agrees.
+IUPAC = {"A": "A", "C": "C", "G": "G", "T": "T", "R": "AG", "Y": "CT", "S": "GC",
+         "W": "AT", "K": "GT", "M": "AC", "B": "CGT", "D": "AGT", "H": "ACT",
+         "V": "ACG", "N": "ACGT"}
+PRIMERS = {                     # name: (forward, reverse)
+    "16S_V1V3": ("AGAGTTTGATCMTGGCTCAG", "ATTACCGCGGCTGCTGG"),
+    "16S_V3V4": ("CCTACGGGNGGCWGCAG", "GACTACHVGGGTATCTAATCC"),
+    "16S_V4":   ("GTGYCAGCMGCCGCGGTAA", "GGACTACNVGGGTWTCTAAT"),
+    "ITS1":     ("CTTGGTCATTTAGAGGAAGTAA", "GCTGCGTTCTTCATCGATGC"),
+}
+
+
+def matches(seq, primer, allow=2):
+    if len(seq) < len(primer):
+        return False
+    miss = 0
+    for s, p in zip(seq, primer):
+        if s not in IUPAC.get(p, p):
+            miss += 1
+            if miss > allow:
+                return False
+    return True
+
+
+def sample_reads(path, n=2000):
+    seqs = []
+    try:
+        with gzip.open(path, "rt") as fh:
+            for i, line in enumerate(fh):
+                if i % 4 == 1:
+                    seqs.append(line.strip())
+                if len(seqs) >= n:
+                    break
+    except OSError:
+        pass
+    return seqs
+
+
+def detect_region(r1, r2):
+    """-> (region, primers_present, evidence). Unknown stays unknown."""
+    s1, s2 = sample_reads(r1), sample_reads(r2) if r2 else []
+    if not s1:
+        return "unknown", False, "could not read FASTQ"
+    best = []
+    for name, (fwd, rev) in PRIMERS.items():
+        f = sum(1 for s in s1 if matches(s, fwd)) / len(s1)
+        r = (sum(1 for s in s2 if matches(s, rev)) / len(s2)) if s2 else None
+        if f > 0.6 and (r is None or r > 0.6):
+            best.append((name, f, r))
+    if len(best) == 1:
+        n, f, r = best[0]
+        return n, True, f"forward primer in {f:.0%} of reads" + (
+            f", reverse in {r:.0%}" if r is not None else " (single-end)")
+    if len(best) > 1:
+        return "ambiguous", True, f"several primers matched: {[b[0] for b in best]}"
+    # No full-length match. Two very different situations, kept apart: the
+    # primer may still be there but diverge past its first bases (27F does), or
+    # the library really is pre-trimmed. Neither is assumed to be 16S.
+    common, hits = collections.Counter(s[:10] for s in s1).most_common(1)[0]
+    pct = hits * 100 // len(s1)
+    for name, (fwd, _) in PRIMERS.items():
+        if matches(common, fwd[:10], allow=1) and pct > 60:
+            return (f"primer_like_{name}", True,
+                    f"5' 10-mer {common} in {pct}% of reads matches the start of the "
+                    f"{name} forward primer, but the full primer did not match within "
+                    f"2 mismatches - confirm the exact primer pair from the paper")
+    return ("unknown_pretrimmed", False,
+            f"no primer matched; most common 5' 10-mer {common} ({pct}% of reads) "
+            f"- region must be confirmed from the paper")
+
+
+def load_facts(paper):
+    """The curated, evidence-backed facts for this paper. No file, no analysis."""
+    p = Path(__file__).resolve().parent / "paper_facts" / f"{paper}.json"
+    if not p.exists():
+        return None, (f"no paper_facts/{paper}.json: the primers, amplicon length and "
+                      "sample identity have not been verified against the paper")
+    return json.loads(p.read_text(encoding="utf-8")), None
+
+
+def check_facts(facts, region, primers_present):
+    """Confirm the reads agree with the file. Returns a list of blocking reasons."""
+    bad, amp, ident = [], facts.get("amplicon", {}), facts.get("sample_identity", {})
+    if amp.get("status") != "verified":
+        bad.append(f"paper_facts amplicon.status is {amp.get('status')!r}, not 'verified'")
+    declared, has_primers = amp.get("region"), amp.get("primers_in_reads")
+    # A disagreement between the paper and the reads is never resolved silently
+    # in favour of either one. The one exception is not a disagreement: when the
+    # paper's primers are absent BECAUSE the library arrived pre-trimmed, the
+    # detector cannot name a region and says so, which is what the file claims.
+    ok = {declared, f"primer_like_{declared}"}
+    if has_primers is False:
+        ok.add("unknown_pretrimmed")
+    if declared and region not in ok:
+        bad.append(f"the reads look like {region!r} but paper_facts says {declared!r}")
+    if "primers_in_reads" in amp and bool(amp["primers_in_reads"]) != bool(primers_present):
+        bad.append(f"paper_facts says primers_in_reads={amp['primers_in_reads']} "
+                   f"but the reads say {primers_present}")
+    # Sample identity is gated on its own: having the primers proves nothing
+    # about which sample is which.
+    if ident.get("status") not in ("verified", "partial", "unresolved"):
+        bad.append("paper_facts sample_identity.status is missing or not one of "
+                   "verified/partial/unresolved - sample identity has not been checked")
+    if not ident.get("usable_for"):
+        bad.append("paper_facts sample_identity.usable_for is empty - it must say "
+                   "what the resolved metadata actually supports")
+    return bad
+
+
+def split_controls(samples, facts):
+    """Technical controls (blanks, dilution series) are not biological samples."""
+    pref = tuple(facts.get("sample_identity", {}).get("exclude_alias_prefixes", []))
+    if not pref:
+        return samples, []
+    keep = [s for s in samples if not s.get("sample_alias", "").startswith(pref)]
+    drop = [s for s in samples if s.get("sample_alias", "").startswith(pref)]
+    return keep, drop
+
+
+def load_samples(out_dir):
+    p = out_dir / "sample_metadata.csv"
+    if not p.exists():
+        raise SystemExit(f"missing {p}; run step 2 first")
+    with p.open(encoding="utf-8-sig", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def r_available():
+    probe = ("module load r/4.6.0 >/dev/null 2>&1; "
+             "Rscript -e 'quit(status=!requireNamespace(\"dada2\", quietly=TRUE))'")
+    return subprocess.run(["bash", "-lc", probe]).returncode == 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--paper", required=True)
+    ap.add_argument("--reads-root", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--preflight", action="store_true")
+    ap.add_argument("--silva", type=Path, default=None,
+                    help="DADA2-formatted SILVA training fasta (required to assign taxonomy)")
+    ap.add_argument("--silva-species", type=Path, default=None,
+                    help="SILVA assignSpecies fasta (exact-match species, optional)")
+    ap.add_argument("--probe-only", action="store_true",
+                    help="choose truncLen on a few samples and stop, before the full run")
+    ap.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 4)))
+    args = ap.parse_args()
+
+    gate = args.out_dir / "metadata_gate.txt"
+    verdict = gate.read_text(encoding="utf-8").strip() if gate.exists() else "blocked:no gate"
+    if not verdict.startswith("pass"):
+        raise SystemExit(f"metadata gate did not pass: {verdict}")
+    # A quantification-only pass is still a pass for producing per-sample
+    # matrices, but the limit travels with the outputs instead of being lost
+    # here, so nobody later reads the matrix as group-labelled.
+    quant_only = verdict.startswith("pass_quantification_only")
+
+    facts, facts_err = load_facts(args.paper)
+    all_samples = load_samples(args.out_dir)
+    samples, controls = split_controls(all_samples, facts or {})
+    for rows, name in ((samples, "samples_used.csv"),
+                       (controls, "samples_excluded_technical_controls.csv")):
+        if not rows:
+            continue
+        with (args.out_dir / name).open("w", encoding="utf-8-sig", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+    branches = collections.Counter(s["analysis_branch"] for s in samples)
+
+    first = samples[0]
+    run0 = first["run_accessions"].split(";")[0]
+    rdir = args.reads_root / args.paper / "raw_reads" / run0
+    r1 = next(iter(sorted(rdir.glob("*_1.fastq.gz"))), None) or \
+        next(iter(sorted(rdir.glob("*.fastq.gz"))), None)
+    r2 = next(iter(sorted(rdir.glob("*_2.fastq.gz"))), None)
+
+    plan = {
+        "paper_folder": args.paper,
+        "metadata_gate": verdict[:400],
+        "grouped_analysis_supported": not quant_only,
+        "n_biological_samples": len(samples),
+        "n_technical_controls_excluded": len(controls),
+        "branches": dict(branches),
+        "paired": bool(r2),
+        "tools": {},
+        "blocking": [],
+    }
+    if facts_err:
+        plan["blocking"].append(facts_err)
+    else:
+        plan["paper_facts"] = {
+            "sources": facts.get("sources", []),
+            "sample_identity_status": facts["sample_identity"]["status"],
+            "usable_for": facts["sample_identity"]["usable_for"],
+            "not_usable_for": facts["sample_identity"].get("not_usable_for", []),
+        }
+
+    if "amplicon" in branches:
+        region, primers, evidence = detect_region(r1, r2)
+        plan["amplicon_region"] = region
+        plan["primers_present"] = primers
+        plan["region_evidence"] = evidence
+        plan["tools"]["R_dada2"] = "available" if r_available() else "MISSING"
+        if facts:
+            plan["blocking"] += check_facts(facts, region, primers)
+            amp = facts["amplicon"]
+            # Everything the denoiser needs comes from the verified file, in the
+            # one coordinate system it declares (raw read bases, before trimLeft).
+            plan["trim_left"] = amp["trim_left"]
+            plan["max_trunc_len"] = amp["max_trunc_len"]
+            plan["insert_p99"] = amp["insert_length_primer_free"]["p99"]
+            plan["min_overlap"] = amp["merge_budget"]["min_overlap"]
+            plan["required_raw_sum"] = amp["merge_budget"]["required_raw_sum"]
+            plan["trunc_len_basis"] = amp["trunc_len_basis"]
+            if sum(amp["max_trunc_len"]) < amp["merge_budget"]["required_raw_sum"]:
+                plan["blocking"].append(
+                    "the reads cannot span this amplicon: max truncLen sum "
+                    f"{sum(amp['max_trunc_len'])} < required {amp['merge_budget']['required_raw_sum']}")
+        elif region in ("unknown", "ambiguous", "unknown_pretrimmed"):
+            plan["blocking"].append(
+                f"amplicon region not established from reads ({region}); "
+                "confirm primers/region from the paper before denoising")
+        rscript = Path(__file__).resolve().parent / "step3_16s.R"
+        if not rscript.exists():
+            plan["blocking"].append(f"{rscript.name} not written yet "
+                                    "(denoising parameters pending confirmation)")
+        if plan["tools"]["R_dada2"] != "available":
+            plan["blocking"].append("R module with dada2 not available")
+        if not args.silva:
+            plan["blocking"].append(
+                "no --silva training set given; ASV counts can be produced but "
+                "taxonomy cannot be assigned")
+    for b in ("dna_shotgun", "rna"):
+        if b in branches:
+            have = {t: (shutil.which(t) or "MISSING")
+                    for t in (["bowtie2", "coverm"] if b == "dna_shotgun"
+                              else ["bowtie2", "kraken2"])}
+            plan["tools"][b] = have
+            plan["blocking"].append(
+                f"branch '{b}' not implemented yet; missing tools "
+                f"{[k for k, v in have.items() if v == 'MISSING']}")
+
+    free = shutil.disk_usage(args.out_dir).free
+    plan["disk_free_bytes"] = free
+    plan["disk_free_human"] = f"{free/2**40:.2f} TiB"
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    (args.out_dir / "analysis_plan.json").write_text(
+        json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+
+    if args.preflight:
+        return 0
+    if plan["blocking"]:
+        raise SystemExit("blocked:\n  " + "\n  ".join(plan["blocking"]))
+
+    # --- amplicon branch: hand off to DADA2 --------------------------------
+    cmd = ["bash", "-lc",
+           f"module load r/4.6.0 && Rscript {Path(__file__).resolve().parent/'step3_16s.R'} "
+           f"--paper {args.paper} --reads-root {args.reads_root} "
+           f"--out-dir {args.out_dir} --region {plan['amplicon_region']} "
+           f"--trim-left {plan['trim_left'][0]},{plan['trim_left'][1]} "
+           f"--max-trunc {plan['max_trunc_len'][0]},{plan['max_trunc_len'][1]} "
+           f"--insert-p99 {plan['insert_p99']} --min-overlap {plan['min_overlap']} "
+           f"--threads {args.threads} --silva {args.silva}"
+           + (f" --silva-species {args.silva_species}" if args.silva_species else "")
+           + (" --probe-only" if args.probe_only else "")]
+    return subprocess.run(cmd).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

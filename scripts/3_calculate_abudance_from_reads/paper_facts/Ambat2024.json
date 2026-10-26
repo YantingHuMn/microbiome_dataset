@@ -1,0 +1,96 @@
+{
+  "paper_folder": "Ambat2024",
+  "doi": "10.1080/19490976.2024.2382324",
+  "verified_on": "2026-10-22",
+  "sources": [
+    "Full text: PMC11290756 (Gut Microbes 16:2382324), Methods, '16s rRNA gene sequencing'"
+  ],
+  "amplicon": {
+    "status": "verified",
+    "region": "16S_V3V4",
+    "paper_statement": "PCR amplicons targeting the V3-V4 region; 16S Amplicon PCR Forward Primer = 5'CCTACGGGNGGCWGCAG, Reverse Primer = 5'GACTACHVGGGTATCTAATCC, attached to Illumina overhang adaptors; Illumina MiSeq 2 x 300 bp paired-end; 'Demultiplexed and adaptor-trimmed reads' were used.",
+    "forward_primer": {
+      "name": "341F",
+      "seq": "CCTACGGGNGGCWGCAG",
+      "length": 17
+    },
+    "reverse_primer": {
+      "name": "805R",
+      "seq": "GACTACHVGGGTATCTAATCC",
+      "length": 21
+    },
+    "primers_in_reads": true,
+    "primer_evidence": "The overhang ADAPTORS were trimmed by the submitters, but the locus-specific primers were not: with IUPAC expansion and <=2 mismatches the forward primer matches 99% of R1 and the reverse 97% of R2 (probe over 3 runs x 3000 reads).",
+    "read_length": [
+      301,
+      301
+    ],
+    "trim_left": [
+      17,
+      21
+    ],
+    "insert_length_primer_free": {
+      "method": "measured, not assumed: R1 was slid against revcomp(R2) over 2430 read pairs from 5 runs and the aligning offset taken as that molecule's insert length (>=80% identity in the overlap)",
+      "min": 301,
+      "p1": 402,
+      "p5": 402,
+      "median": 421,
+      "p95": 427,
+      "p99": 427,
+      "max": 428,
+      "modes": [
+        402,
+        405,
+        420,
+        421,
+        427
+      ],
+      "note": "The often-quoted '~465 bp' for 341F/805R is the E. coli amplicon INCLUDING both primers. The real primer-free inserts here are 402-428 bp and clearly multi-modal across taxa, so a single fixed length must not be used."
+    },
+    "trunc_len_basis": "RAW read coordinates. dada2::filterAndTrim truncates to truncLen FIRST and removes trimLeft afterwards, so the retained biological sequence is truncLen - trimLeft. Every merge constraint below is stated in the same raw-read units.",
+    "merge_budget": {
+      "min_overlap": 12,
+      "required_raw_sum": 477,
+      "formula": "truncLen[1] + truncLen[2] >= insert_p99 + min_overlap + trimLeft[1] + trimLeft[2] = 427 + 12 + 38",
+      "available_raw_sum": 602,
+      "slack": 125
+    },
+    "read_through": "none: only 2 of 20228 R1 reads ran into revcomp(805R), so no 3' adaptor read-through to trim; truncLen is limited by quality alone.",
+    "max_trunc_len": [
+      301,
+      301
+    ],
+    "max_trunc_len_reason": "read length; no 3' read-through to avoid"
+  },
+  "sample_identity": {
+    "status": "partial",
+    "n_biological_samples": 110,
+    "n_runs": 110,
+    "runs_per_sample": "1 (no technical replicates to merge)",
+    "technical_controls_in_run_set": "none detected: ENA isolation_source is 'stool' for all 110 and no buffer/blank/mock aliases are present",
+    "decodable_from_alias": {
+      "timepoint": "the _<n>DPI / _D<n> suffix is days post-induction",
+      "sample_type": "the _Colon / _Cecum suffix marks terminal tissue-site samples; the rest are stool",
+      "sex": "the M / F letter in prefixes such as BPCM3 / BPCF3"
+    },
+    "group_assignment": {
+      "status": "unresolved",
+      "reason": "The alias prefixes (BPC, CRN, EI, EBP, EIBP, G1-G5, D1-D4) are not defined anywhere in the paper, its figures or its supplementary material. Expanding them would be a guess.",
+      "action": "experimental_group stays 'unresolved' in sample_metadata.csv. ASV and relative-abundance tables can still be built; any case/control use of this paper is blocked until the author's key is obtained."
+    },
+    "usable_for": [
+      "ASV / relative-abundance tables",
+      "within-paper comparisons by timepoint and by sample type (stool / colon / cecum)"
+    ],
+    "not_usable_for": [
+      "any treatment-group contrast: the alias prefixes are undefined in the paper"
+    ],
+    "exclude_alias_prefixes": []
+  },
+  "experiment": {
+    "host": "Mus musculus",
+    "body_site": "gut (stool, colon, cecum)",
+    "design": "germ-free and human-microbiota-associated mice; SC-4 consortium of 4 rare SCFA-producing bacteria +/- inulin; DSS-induced colitis; longitudinal sampling",
+    "disease": "DSS-induced colitis (model for IBD)"
+  }
+}
