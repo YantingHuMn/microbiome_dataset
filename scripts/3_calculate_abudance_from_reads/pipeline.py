@@ -26,9 +26,12 @@ import csv
 import json
 import os
 import subprocess
+import socket
 import sys
 import time
 from pathlib import Path
+
+import registry
 
 HERE = Path(__file__).resolve().parent
 MYPROJECT = Path("/hickory/proj/didonglab/dataset/virus/yanting/microbiome_dataset/myproject")
@@ -57,21 +60,21 @@ def load_state():
 
 
 def save_state(state):
+    """Write the audit trail, then rebuild every per-paper view from it.
+
+    pipeline_state.csv keeps one row per (paper, step) because that is what the
+    resume logic reads. Everything a human reads is one row per PAPER and is
+    derived here, so the two can never disagree.
+    """
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     rows = sorted(state.values(), key=lambda r: (r["paper_folder"].lower(), r["step"]))
-    for path, keep in ((STATE, None),
-                       (OUT_ROOT / "pipeline_completed.csv",
-                        {"done", "done_quantification_only", "done_partial"}),
-                       (OUT_ROOT / "pipeline_failed.csv",
-                        {"failed", "metadata_blocked", "no_space",
-                         "skipped_unsuitable", "preflight_ok"})):
-        sel = rows if keep is None else [r for r in rows if r["status"] in keep]
-        tmp = path.with_suffix(".csv.tmp")
-        with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
-            w.writeheader()
-            w.writerows(sel)
-        os.replace(tmp, path)
+    tmp = STATE.with_suffix(".csv.tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, STATE)
+    registry.rebuild(OUT_ROOT, rows)
 
 
 def record(state, paper, step, status, reason="", result_path=""):
@@ -154,9 +157,12 @@ def step_abundance(paper, args):
     for flag, val in (("--sylph-db", args.sylph_db), ("--sylph-tax", args.sylph_tax),
                       ("--viral-index", args.viral_index),
                       ("--viral-catalogue-name", args.viral_catalogue_name),
+                      ("--viral-catalogue-scope", args.viral_catalogue_scope),
                       ("--host-index", args.host_index)):
         if val:
             cmd += [flag, str(val)]
+    if args.archive_old:
+        cmd.append("--archive-old")
     if args.preflight:
         cmd.append("--preflight")
     ok, tail = run(cmd, out / "logs" / "step3_abundance.log")
@@ -227,24 +233,75 @@ def step_abundance(paper, args):
 RUNNERS = {1: step_download, 2: step_metadata, 3: step_abundance}
 
 
+def lock_id():
+    """Who this process is, in terms another job can check from another node."""
+    return json.dumps({"host": socket.gethostname(), "pid": os.getpid(),
+                       "job": os.environ.get("SLURM_JOB_ID", ""), "at": now()})
+
+
+def holder_is_gone(raw):
+    """True when the process named in a lock file is provably no longer running.
+
+    A lock is only ever stolen on PROOF of death, never on age: a 16S paper can
+    legitimately sit in dada2 for many hours, and stealing from a live run would
+    have two jobs writing the same output directory. Unparseable or unprovable
+    means held.
+    """
+    try:
+        h = json.loads(raw)
+    except Exception:
+        return False                      # old plain-text lock: leave it alone
+    job = h.get("job") or ""
+    if job:
+        # squeue is authoritative and works from any node. Only its own clean
+        # "not in queue" answer counts; a scheduler hiccup must not free a lock.
+        try:
+            r = subprocess.run(["squeue", "-h", "-j", job, "-o", "%T"],
+                               capture_output=True, text=True, timeout=60)
+        except Exception:
+            return False
+        if r.returncode != 0:
+            # slurm says the job id is unknown -> it has left the queue.
+            return "Invalid job id" in (r.stderr or "")
+        return not r.stdout.strip()
+    if h.get("host") != socket.gethostname():
+        return False                      # another node's pid means nothing here
+    try:
+        os.kill(int(h["pid"]), 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
 def process(paper, args, state):
     lock = OUT_ROOT / paper / ".lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, f"{os.getpid()} {now()}\n".encode())
+        os.write(fd, (lock_id() + "\n").encode())
         os.close(fd)
     except FileExistsError:
-        # A lock left behind by a killed run blocks this paper forever, so say
-        # who holds it and since when instead of just "skipped".
         try:
             held = lock.read_text().strip()
             age = int(time.time() - lock.stat().st_mtime)
         except OSError:
-            held, age = "unknown", -1
-        print(f"  {paper}: locked by '{held}' for {age}s ({lock}). If that process "
-              f"is gone, delete the file to let this paper run.")
-        return
+            held, age = "", -1
+        if holder_is_gone(held):
+            # A job killed by the wall clock leaves its lock behind. Taking it
+            # over is the whole point: otherwise one timeout strands every
+            # paper that job held, silently, for every later submission.
+            print(f"  {paper}: taking over a lock left by a job that is gone ({held})")
+            try:
+                lock.write_text(lock_id() + "\n", encoding="utf-8")
+            except OSError as e:
+                print(f"  {paper}: could not take the lock over ({e}); skipped")
+                return
+        else:
+            print(f"  {paper}: locked by '{held}' for {age}s ({lock}). If that "
+                  f"process is gone, delete the file to let this paper run.")
+            return
     try:
         for step in args.steps:
             prev = state.get((paper, str(step)), {})
@@ -263,6 +320,13 @@ def process(paper, args, state):
                 break          # this paper stops; others continue
     finally:
         lock.unlink(missing_ok=True)
+        # Hand the paper back as soon as ITS run ends, not when the whole job
+        # ends: the next submission must see it as finished rather than as
+        # still being worked on.
+        if args.release_claims:
+            subprocess.run([sys.executable, str(HERE / "claim_papers.py"),
+                            "--release", paper, "--out-root", str(OUT_ROOT)],
+                           capture_output=True, text=True)
 
 
 def main():
@@ -293,7 +357,12 @@ def main():
     ap.add_argument("--sylph-tax", default="")
     ap.add_argument("--viral-index", default="")
     ap.add_argument("--viral-catalogue-name", default="unnamed")
+    ap.add_argument("--viral-catalogue-scope", default="")
     ap.add_argument("--host-index", default="")
+    ap.add_argument("--archive-old", action="store_true",
+                    help="move previous step-3 outputs into _archive/<utc>/")
+    ap.add_argument("--release-claims", action="store_true",
+                    help="remove each paper from its claims/ file when its run ends")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     args.steps = [int(s) for s in str(args.steps).split(",") if s.strip()]

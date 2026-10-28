@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import branches
@@ -112,7 +113,19 @@ def branches_desc(b):
     return branches.BRANCHES.get(b, ("unknown", ""))[0]
 
 
-def load_facts(paper, reads_root=None, out_dir=None):
+def facts_path(paper):
+    return Path(__file__).resolve().parent / "paper_facts" / f"{paper}.json"
+
+
+def read_facts(paper):
+    """The facts file if it exists. (None, None) when it does not."""
+    p = facts_path(paper)
+    if not p.exists():
+        return None, None
+    return json.loads(p.read_text(encoding="utf-8")), None
+
+
+def measure_facts(paper, reads_root=None, out_dir=None, samples_file=None):
     """The facts for this paper, measured from its reads if not already on file.
 
     Everything step 3 needs here - which primers are on the reads, how long the
@@ -124,14 +137,15 @@ def load_facts(paper, reads_root=None, out_dir=None):
     An existing file is NEVER overwritten: a hand-curated one carries evidence
     from the paper itself that no measurement can reproduce.
     """
-    p = Path(__file__).resolve().parent / "paper_facts" / f"{paper}.json"
+    p = facts_path(paper)
     if not p.exists():
         if reads_root is None or out_dir is None:
             return None, f"no paper_facts/{paper}.json and nothing to measure from"
         print(f"no paper_facts/{paper}.json yet - measuring it from the reads")
         r = subprocess.run(
             [sys.executable, str(Path(__file__).resolve().parent / "make_paper_facts.py"),
-             "--paper", paper, "--reads-root", str(reads_root), "--out-dir", str(out_dir)],
+             "--paper", paper, "--reads-root", str(reads_root), "--out-dir", str(out_dir)]
+            + (["--samples", str(samples_file)] if samples_file else []),
             text=True, capture_output=True)
         print(r.stdout.strip() or r.stderr.strip()[-600:])
         if r.returncode != 0 or not p.exists():
@@ -239,8 +253,14 @@ def main():
                     help="sylph-tax metadata name matching --sylph-db")
     ap.add_argument("--viral-index", default="",
                     help="bowtie2 index prefix of the viral catalogue")
+    ap.add_argument("--viral-catalogue-scope", default="",
+                    help="which environment this catalogue is for, as |-separated "
+                         "words to look for in the samples, e.g. 'human|homo|gut'")
     ap.add_argument("--viral-catalogue-name", default="unnamed",
                     help="catalogue name + version, recorded in the outputs")
+    ap.add_argument("--archive-old", action="store_true",
+                    help="move a previous run's outputs into _archive/<utc>/ "
+                         "instead of overwriting them")
     ap.add_argument("--host-index", default="",
                     help="bowtie2 index of the host genome, for host read removal")
     ap.add_argument("--threads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 4)))
@@ -255,19 +275,52 @@ def main():
     # here, so nobody later reads the matrix as group-labelled.
     quant_only = verdict.startswith("pass_quantification_only")
 
-    facts, facts_err = load_facts(args.paper, args.reads_root, args.out_dir)
+    # Read an existing facts file first: split_controls needs its exclusion
+    # prefixes, but MEASURING a missing one needs the amplicon sample list,
+    # which only exists after the split. So: read now, measure after.
+    facts, facts_err = read_facts(args.paper)
     all_samples = load_samples(args.out_dir)
     samples, controls = split_controls(all_samples, facts or {})
-    for rows, name in ((samples, "samples_used.csv"),
-                       (controls, "samples_excluded_technical_controls.csv")):
+    def dump(rows, name):
         if not rows:
-            continue
-        with (args.out_dir / name).open("w", encoding="utf-8-sig", newline="") as fh:
+            return None
+        path = args.out_dir / name
+        with path.open("w", encoding="utf-8-sig", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
             w.writeheader(); w.writerows(rows)
+        return path
+
+    dump(samples, "samples_used.csv")          # everything, for reference
+    dump(controls, "samples_excluded_technical_controls.csv")
+
+    # One sample list PER BRANCH. A paper can hold several assay types at once -
+    # 11 of the 78 surveyed do - and handing the whole list to a branch would
+    # denoise shotgun or RNA runs as if they were this paper's amplicon.
+    # Within a branch, paired and single-end are split too: they are different
+    # analyses producing fragments of different length.
+    def key_of(s):
+        b = s["analysis_branch"]
+        return f"{b}_single" if (b == "amplicon" and
+                                 s.get("library_layout", "").upper() == "SINGLE") else b
+
+    per_branch = collections.defaultdict(list)
+    for s_ in samples:
+        per_branch[key_of(s_)].append(s_)
+    sample_file = {k: dump(v, f"samples_used_{k}.csv") for k, v in per_branch.items()}
+    if len(per_branch) > 1:
+        print("this paper holds several assay/layout groups; each gets its own "
+              "sample list and its own output: " +
+              ", ".join(f"{k}={len(v)}" for k, v in sorted(per_branch.items())))
     # NB: not named `branches` - that is the module defining what each
     # branch name means, and shadowing it broke the marker lookup.
-    assays = collections.Counter(s["analysis_branch"] for s in samples)
+    assays = collections.Counter({k: len(v) for k, v in per_branch.items()})
+
+    if facts is None:
+        # Measured from the AMPLICON reads only, never from a shotgun or RNA run
+        # that happens to sit in the same paper.
+        amp_list = sample_file.get("amplicon") or sample_file.get("amplicon_single")
+        facts, facts_err = measure_facts(args.paper, args.reads_root, args.out_dir,
+                                         amp_list)
 
     # Probe several samples spread across the run list, not just the first: a
     # paper can mix primer sets or re-sequence part of a cohort, and one sample
@@ -278,7 +331,9 @@ def main():
         b = sorted(rdir.glob("*_2.fastq.gz"))
         return (a[0] if a else None), (b[0] if b else None)
 
-    runs = [s["run_accessions"].split(";")[0] for s in samples]
+    amp_samples = (per_branch.get("amplicon", []) +
+                   per_branch.get("amplicon_single", [])) or samples
+    runs = [s["run_accessions"].split(";")[0] for s in amp_samples]
     idx = sorted({round(i * (len(runs) - 1) / max(args.probe_n - 1, 1))
                   for i in range(min(args.probe_n, len(runs)))})
     probes = [(runs[i], *mates(runs[i])) for i in idx]
@@ -326,7 +381,18 @@ def main():
             declared if region == "unknown_pretrimmed" and declared else region)
         plan["amplicon_branch"] = marker_branch
         plan["branch_status"] = plan.get("branch_status", {})
-        if marker_branch != "amplicon_16s":
+        # Paired and single-end 16S are different analyses, not a flag: the
+        # paired script is built around a merge that does not exist here.
+        # Layout was already used to split the sample lists, so a paper that
+        # mixes PAIRED and SINGLE now runs BOTH scripts on its own half instead
+        # of being blocked outright. The two ASV tables stay separate because
+        # their fragments are different lengths.
+        plan["library_layout"] = sorted(
+            {x.get("library_layout", "").upper() for x in amp_samples})
+        plan["amplicon_groups"] = {
+            ("amplicon_16s_single" if k == "amplicon_single" else "amplicon_16s"):
+                len(v) for k, v in per_branch.items() if k.startswith("amplicon")}
+        if marker_branch not in ("amplicon_16s", "amplicon_16s_single"):
             # ITS / 18S / anything else must not be denoised against a 16S
             # training set just because DADA2 would happily run on it.
             plan["branch_status"][marker_branch] = "unsupported"
@@ -401,6 +467,29 @@ def main():
             need("dna_shotgun_bacteria", ["fastp", "sylph"],
                  {"sylph_db": args.sylph_db})
         if args.quantify in ("viruses", "both"):
+            # A catalogue is built for an environment. UHGV is human gut; mapping
+            # a mouse, plant or marine library against it reports "how much human
+            # gut virus is in this sample", which is not a virome.
+            scope = (args.viral_catalogue_scope or "").strip().lower()
+            host = " ".join(filter(None, (
+                (facts or {}).get("experiment", {}).get("host", ""),
+                (facts or {}).get("experiment", {}).get("body_site", ""),
+                samples[0].get("host", ""), samples[0].get("body_site", ""),
+                samples[0].get("isolation_source", "")))).lower()
+            # Groups separated by ';' must ALL match; alternatives inside a
+            # group are separated by '|'. Host and site are separate groups
+            # because matching only one lets a MOUSE GUT sample through a HUMAN
+            # GUT catalogue - the exact mistake this check exists to stop.
+            groups = [g.strip() for g in scope.split(";") if g.strip()]
+            unmatched = [g for g in groups
+                         if not any(w.strip() in host for w in g.split("|") if w.strip())]
+            if scope and host and unmatched:
+                plan["blocking"].append(
+                    f"the viral catalogue requires {unmatched} but this paper's "
+                    f"samples look like {host[:80]!r}. Mapping them to the wrong "
+                    "catalogue would report presence of viruses that have no reason "
+                    "to be there. Set VIRAL_CATALOGUE_SCOPE to match, or point "
+                    "VIRAL_INDEX at a catalogue for this environment.")
             # A VLP-enriched library gets the viral branch only: counting
             # bacteria in a library built to exclude them produces a number
             # with no interpretation.
@@ -442,7 +531,8 @@ def main():
     deferred = {b for b, st in plan["branch_status"].items() if st in branch_level}
     fatal = [b for b in plan["blocking"]
              if not any(f"'{d}'" in b or d in b for d in deferred)]
-    runnable = ("amplicon" in assays and plan.get("amplicon_branch") == "amplicon_16s") \
+    runnable = ("amplicon" in assays and plan.get("amplicon_branch") in
+                ("amplicon_16s", "amplicon_16s_single")) \
         or any(st == "ready" for st in plan["branch_status"].values())
     if fatal or not runnable:
         raise SystemExit("blocked:\n  " + "\n  ".join(plan["blocking"] or
@@ -456,26 +546,60 @@ def main():
     # others from producing what they can.
     results, HERE = {}, Path(__file__).resolve().parent
 
-    if "amplicon" in assays and plan.get("amplicon_branch") == "amplicon_16s":
-        plan["branch_status"]["amplicon_16s"] = "running"
+    if args.archive_old:
+        # Move a previous run's outputs aside instead of writing over them, so a
+        # rerun can be compared with what it replaced rather than erasing it.
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        for sub in ("dada2", "shotgun", "virome"):
+            d = args.out_dir / sub
+            if d.exists() and any(d.iterdir()):
+                dest = args.out_dir / "_archive" / stamp / sub
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(d), str(dest))
+                print(f"archived previous {sub}/ -> {dest}")
+
+    # Each amplicon group runs on its OWN sample list, into its OWN directory.
+    # A paper that mixes paired and single-end gets two tables that must not be
+    # merged on ASV sequence; the single-end README says so.
+    for key, group in sorted(per_branch.items()):
+        if not key.startswith("amplicon"):
+            continue
+        single = key.endswith("_single")
+        b = "amplicon_16s_single" if single else "amplicon_16s"
+        if plan.get("amplicon_branch") not in ("amplicon_16s", "amplicon_16s_single"):
+            continue                       # marker is not 16S; already recorded
+        sub = "dada2_single" if single else "dada2"
+        plan["branch_status"][b] = "running"
+        script = "step3_16s_single.R" if single else "step3_16s.R"
+        common = (f"--paper {args.paper} --reads-root {args.reads_root} "
+                  f"--out-dir {args.out_dir} --region {plan['amplicon_region']} "
+                  f"--samples {sample_file[key]} --out-sub {sub} "
+                  f"--threads {args.threads} --silva {args.silva} "
+                  f"--grouped-analysis {int(not quant_only)} "
+                  f"--amplicon-status "
+                  f"{plan.get('paper_facts', {}).get('amplicon_status', 'unknown')}")
+        if single:
+            # One read: no reverse primer to trim, no merge budget to respect.
+            extra = (f" --trim-left {plan['trim_left'][0]} "
+                     f"--max-trunc {plan['max_trunc_len'][0]}")
+        else:
+            extra = (f" --trim-left {plan['trim_left'][0]},{plan['trim_left'][1]} "
+                     f"--max-trunc {plan['max_trunc_len'][0]},{plan['max_trunc_len'][1]} "
+                     f"--insert-p99 {plan['insert_p99']} "
+                     f"--min-overlap {plan['min_overlap']}")
         cmd = ["bash", "-lc",
-               f"module load r/4.6.0 && Rscript {HERE/'step3_16s.R'} "
-               f"--paper {args.paper} --reads-root {args.reads_root} "
-               f"--out-dir {args.out_dir} --region {plan['amplicon_region']} "
-               f"--trim-left {plan['trim_left'][0]},{plan['trim_left'][1]} "
-               f"--max-trunc {plan['max_trunc_len'][0]},{plan['max_trunc_len'][1]} "
-               f"--insert-p99 {plan['insert_p99']} --min-overlap {plan['min_overlap']} "
-               f"--threads {args.threads} --silva {args.silva} "
-               f"--grouped-analysis {int(not quant_only)} "
-           f"--amplicon-status {plan.get('paper_facts', {}).get('amplicon_status', 'unknown')}"
+               f"module load r/4.6.0 && Rscript {HERE/script} " + common + extra
                + (f" --silva-species {args.silva_species}" if args.silva_species else "")
                + (" --probe-only" if args.probe_only else "")]
-        results["amplicon_16s"] = subprocess.run(cmd).returncode
+        print(f"--- {b}: {len(group)} samples -> {sub}/")
+        results[b] = subprocess.run(cmd).returncode
 
     if plan["branch_status"].get("dna_shotgun_bacteria") == "ready":
         cmd = [sys.executable, str(HERE / "step3_shotgun.py"), "--paper", args.paper,
                "--reads-root", str(args.reads_root), "--out-dir", str(args.out_dir),
                "--sylph-db", args.sylph_db, "--threads", str(args.threads)]
+        if sample_file.get("dna_shotgun"):
+            cmd += ["--samples", str(sample_file["dna_shotgun"])]
         if args.sylph_tax:
             cmd += ["--sylph-tax", args.sylph_tax]
         if args.host_index:
@@ -488,6 +612,9 @@ def main():
                "--reads-root", str(args.reads_root), "--out-dir", str(args.out_dir),
                "--bowtie2-index", args.viral_index, "--threads", str(args.threads),
                "--catalogue-name", args.viral_catalogue_name, "--library-type", lib]
+        vkey = "dna_virome" if sample_file.get("dna_virome") else "dna_shotgun"
+        if sample_file.get(vkey):
+            cmd += ["--samples", str(sample_file[vkey])]
         results["viral_mapping"] = subprocess.run(cmd).returncode
 
     if not results:

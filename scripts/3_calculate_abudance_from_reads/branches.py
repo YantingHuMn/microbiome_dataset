@@ -21,6 +21,8 @@ before any branch is allowed to run, and anything still ambiguous blocks.
 BRANCHES = {
     "amplicon_16s": ("16S/16S-like rRNA amplicon (bacteria + archaea)",
                      "DADA2 ASVs + SILVA, step3_16s.R"),
+    "amplicon_16s_single": ("16S amplicon sequenced single-end",
+                            "DADA2 on R1 only, no merge, step3_16s_single.R"),
     "amplicon_its": ("ITS amplicon (fungi)", "not implemented"),
     "amplicon_18s": ("18S rRNA amplicon (eukaryotes)", "not implemented"),
     "amplicon_other": ("an amplicon of some other marker", "not implemented"),
@@ -37,7 +39,8 @@ BRANCHES = {
 }
 
 #: Branches step 3 can actually run today.
-IMPLEMENTED = {"amplicon_16s", "dna_shotgun", "dna_virome"}
+IMPLEMENTED = {"amplicon_16s", "amplicon_16s_single", "dna_shotgun",
+               "dna_virome"}
 
 #: Amplicon markers, resolved from the reads in step 3 rather than assumed.
 MARKER_TO_BRANCH = {

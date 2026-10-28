@@ -43,8 +43,10 @@ def sh(cmd, **kw):
                           capture_output=True, **kw)
 
 
-def load_samples(out_dir):
-    p = out_dir / "samples_used.csv"
+def load_samples(out_dir, path=None):
+    # The caller passes the list for THIS branch; a paper can hold several assay
+    # types and the others' runs must not come along.
+    p = Path(path) if path else out_dir / "samples_used.csv"
     if not p.exists():
         raise SystemExit(f"missing {p}; run step 3 preflight first")
     with p.open(encoding="utf-8-sig", newline="") as fh:
@@ -158,6 +160,8 @@ def main():
     ap.add_argument("--paper", required=True)
     ap.add_argument("--reads-root", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--samples", default="",
+                    help="sample list for this branch; defaults to samples_used.csv")
     ap.add_argument("--bowtie2-index", required=True,
                     help="prefix of a prebuilt bowtie2 index of the viral catalogue")
     ap.add_argument("--catalogue-name", default="unnamed",
@@ -181,7 +185,7 @@ def main():
 
     out = args.out_dir / "virome"
     out.mkdir(parents=True, exist_ok=True)
-    samples = load_samples(args.out_dir)
+    samples = load_samples(args.out_dir, args.samples)
     lens = genome_lengths(args.bowtie2_index)
     print(f"{args.paper}: {len(samples)} samples vs {len(lens)} reference genomes")
 

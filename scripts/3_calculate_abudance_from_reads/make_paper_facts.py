@@ -76,10 +76,23 @@ def find(seq, pat, allow=1):
     return -1
 
 
-def probe_runs(out_dir, n):
-    """Representative runs spread across the sample list, from step 2's map."""
+def probe_runs(out_dir, n, samples_file=None):
+    """Representative runs spread across the sample list, from step 2's map.
+
+    `samples_file` restricts the probe to one branch's samples. Without it, a
+    paper that holds shotgun or RNA runs alongside its amplicon would have
+    those probed for 16S primers - which either disagrees with the amplicon
+    runs and stops the paper, or quietly measures an insert length from reads
+    that have no amplicon at all.
+    """
+    keep = None
+    if samples_file and Path(samples_file).exists():
+        with Path(samples_file).open(encoding="utf-8-sig", newline="") as fh:
+            keep = {r["sample_id"].strip() for r in csv.DictReader(fh)}
     with (out_dir / "run_sample_mapping.csv").open(encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.DictReader(fh))
+    if keep is not None:
+        rows = [r for r in rows if r["biosample_accession"].strip() in keep]
     by_run = collections.defaultdict(dict)
     for r in rows:
         by_run[r["run_accession"]][r["mate"]] = r["fastq_path"]
@@ -96,6 +109,8 @@ def main():
     ap.add_argument("--paper", required=True)
     ap.add_argument("--reads-root", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--samples", default="",
+                    help="restrict the probe to this branch's sample list")
     ap.add_argument("--probe-runs", type=int, default=6)
     ap.add_argument("--probe-pairs", type=int, default=800,
                     help="read pairs per run used for the length measurement")
@@ -108,7 +123,7 @@ def main():
                          "written or corrected by hand is not overwritten by "
                          "accident.")
 
-    probes, n_runs = probe_runs(args.out_dir, args.probe_runs)
+    probes, n_runs = probe_runs(args.out_dir, args.probe_runs, args.samples)
     print(f"{args.paper}: probing {len(probes)} of {n_runs} runs")
 
     # ---- 1. which primers, and are they still on the reads -----------------
@@ -126,6 +141,8 @@ def main():
     base = region[len("primer_like_"):] if region.startswith("primer_like_") else region
     fwd, rev = PRIMERS.get(base, ("", ""))
     trim_left = [len(fwd), len(rev)] if primers_present and fwd else [0, 0]
+    if not any(m.get("R2") for _, m in probes):
+        trim_left[1] = 0          # no reverse read, so no reverse primer to trim
 
     # ---- 2. insert length, measured ----------------------------------------
     # Read length is measured on UNTRUNCATED reads. Taking it from the probe
@@ -158,29 +175,40 @@ def main():
                 lens.append(L)
             if rev and find(a, rc(rev)) >= 0:
                 through += 1
-    if not lens:
-        raise SystemExit("could not measure an insert length from any read pair; "
-                         "this paper needs a hand-written facts file")
-    q = statistics.quantiles(lens, n=100)
-    p99 = round(q[98])
-    frac_through = through / max(tried, 1)
-    print(f"  insert length: median {statistics.median(lens):.0f}, p99 {p99}, "
-          f"max {max(lens)}  ({len(lens)}/{tried} pairs overlapped)")
-    print(f"  3' read-through into the reverse primer: {frac_through:.1%}")
+    single_end = not any(m.get("R2") for _, m in probes)
+    if single_end:
+        # One read: there is no second mate to overlap, so no insert length to
+        # measure and no merge budget to respect. The ASV is the truncated read.
+        print("  single-end library: no insert length to measure, no merge budget")
+    elif not lens:
+        raise SystemExit("paired files are listed but no read pair overlapped, so "
+                         "the insert length could not be measured; this paper needs "
+                         "a hand-written facts file")
+    if lens:
+        q = statistics.quantiles(lens, n=100)
+        p99 = round(q[98])
+        frac_through = through / max(tried, 1)
+        print(f"  insert length: median {statistics.median(lens):.0f}, p99 {p99}, "
+              f"max {max(lens)}  ({len(lens)}/{tried} pairs overlapped)")
+        print(f"  3' read-through into the reverse primer: {frac_through:.1%}")
+    else:
+        q, p99, frac_through = None, 0, 0.0
 
     # Read-through means the read runs off the far end into adaptor, so truncLen
     # must stop at the insert; otherwise the read length is the only cap.
     max_trunc = ([p99 + trim_left[0], p99 + trim_left[1]] if frac_through > 0.05
                  else list(read_len))
     max_trunc = [min(max_trunc[i], read_len[i]) for i in (0, 1)]
-    need = p99 + 12 + sum(trim_left)
-    if sum(max_trunc) < need:
+    need = 0 if single_end else p99 + 12 + sum(trim_left)
+    if need and sum(max_trunc) < need:
         print(f"  WARNING reads cannot span this amplicon: {sum(max_trunc)} < {need}")
 
     # ---- 3. sample identity, from step 2 -----------------------------------
     gate = (args.out_dir / "metadata_gate.txt")
     verdict = gate.read_text(encoding="utf-8").strip() if gate.exists() else "unknown"
-    with (args.out_dir / "sample_metadata.csv").open(encoding="utf-8-sig", newline="") as fh:
+    src = (Path(args.samples) if args.samples and Path(args.samples).exists()
+           else args.out_dir / "sample_metadata.csv")
+    with src.open(encoding="utf-8-sig", newline="") as fh:
         samples = list(csv.DictReader(fh))
     ctrl = [s for s in samples if s.get("is_technical_control") == "True"]
     bio = [s for s in samples if s.get("is_technical_control") != "True"]
@@ -209,9 +237,11 @@ def main():
             "primer_evidence": f"probed {len(probes)} runs: {evidence}",
             "read_length": read_len,
             "trim_left": trim_left,
-            "insert_length_primer_free": {
+            "library_layout": "SINGLE" if single_end else "PAIRED",
+            "insert_length_primer_free": {} if single_end else {
                 "method": f"R1 vs revcomp(R2) overlap over {len(lens)} pairs from "
-                          f"{len(probes)} runs (>=80% identity in the overlap)",
+                          f"{len(probes)} runs (>=80% identity in the overlap)"
+                          if lens else "not measurable",
                 "min": min(lens), "p1": round(q[0]), "p5": round(q[4]),
                 # p95/p99/max drive the merge budget and are stable across
                 # probe sets; the median moves with which runs are sampled on a
@@ -229,7 +259,7 @@ def main():
                 "RAW read bases. dada2::fastqPairedFilter removes trimLeft first and "
                 "then truncates to truncLen - trimLeft, keeping only reads at least "
                 "truncLen long, so a read contributes bases trimLeft+1 .. truncLen."),
-            "merge_budget": {
+            "merge_budget": {} if single_end else {
                 "min_overlap": 12,
                 "required_raw_sum": need,
                 "formula": f"truncLen[1]+truncLen[2] >= {p99} + 12 + "
@@ -237,8 +267,9 @@ def main():
                 "available_raw_sum": sum(max_trunc),
                 "slack": sum(max_trunc) - need,
             },
-            "read_through": f"{frac_through:.1%} of probed reads reached revcomp of the "
-                            f"reverse primer",
+            "read_through": ("not applicable to a single-end library" if single_end
+                             else f"{frac_through:.1%} of probed reads reached revcomp "
+                                  "of the reverse primer"),
         },
         "sample_identity": {
             "status": ("verified" if verdict == "pass"

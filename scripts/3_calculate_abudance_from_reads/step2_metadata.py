@@ -167,27 +167,49 @@ def run_model_stage(args, paper_meta, ena_rows, downloaded_runs, log):
 
 
 def label_of(sample_row):
-    """A unique handle for one sample, and the provenance of that handle.
-
-    Preference order: the id the paper itself uses, then the same id proposed
-    but not confirmed against the paper, then the submitter's ENA alias. Only
-    the first is a statement about the paper; the others are recorded as what
-    they are.
-    """
+    """Candidate handles for one sample, best first, each with its provenance."""
+    out = []
     v = sample_row["paper_sample_id"]
     if v not in (UNRESOLVED, NOT_REPORTED, ""):
-        return v, "the paper's own sample id"
+        out.append((v, "the paper's own sample id"))
     try:
         proposed = json.loads(sample_row["proposed_values"] or "{}")
     except ValueError:
         proposed = {}
     v = str((proposed.get("paper_sample_id") or {}).get("value") or "").strip()
     if v:
-        return v, "submitter sample name, not confirmed against the paper"
+        out.append((v, "submitter sample name, not confirmed against the paper"))
     v = sample_row["sample_alias"]
     if v not in (NOT_REPORTED, ""):
-        return v, "ENA sample_alias"
-    return "", "none"
+        out.append((v, "ENA sample_alias"))
+    out.append((sample_row["sample_id"], "BioSample accession (last resort)"))
+    return out
+
+
+def assign_labels(samples):
+    """Pick the best source that actually tells every sample apart.
+
+    Uniqueness is a property of the whole set, not of one row, so the choice
+    has to be made across all samples. A paper's own sample id can legitimately
+    repeat - a paired design sequences the same biological sample twice - and
+    preferring it over a unique ENA alias would say the samples are
+    indistinguishable when they plainly are not.
+    """
+    if not samples:
+        return "none"
+    ranked = [label_of(s) for s in samples]
+    depth = max(len(r) for r in ranked)
+    for level in range(depth):
+        picked = [(r[level] if level < len(r) else ("", "none")) for r in ranked]
+        vals = [v for v, _ in picked]
+        if all(vals) and len(set(vals)) == len(vals):
+            for s, (v, src) in zip(samples, picked):
+                s["sample_label"], s["sample_label_source"] = v, src
+            return picked[0][1]
+    # Nothing is unique: take the best available and let the gate refuse it.
+    for s, r in zip(samples, ranked):
+        s["sample_label"], s["sample_label_source"] = r[0] if r else ("", "none")
+    return "none unique"
 
 
 def index_samples(data):
@@ -396,8 +418,8 @@ def main():
     # sample ids at all; the submitter's alias is then the only sample-level
     # name in existence, and that is enough to keep samples apart even though
     # it is not enough to say what any of them means.
-    for s in samples:
-        s["sample_label"], s["sample_label_source"] = label_of(s)
+    chosen = assign_labels(samples)
+    log(f"samples are told apart by: {chosen}")
     write_csv(args.out_dir / "sample_metadata.csv", samples)
 
     # ---- gate: identity and experiment judged separately -------------------

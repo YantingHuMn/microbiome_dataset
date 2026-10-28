@@ -58,8 +58,9 @@ grouped     <- getarg("--grouped-analysis", "1") == "1"
 amp_status  <- getarg("--amplicon-status", "unknown")
 
 stopifnot(!is.null(paper), !is.null(out_dir), !is.na(insert_p99))
-dir.create(file.path(out_dir, "dada2"), recursive = TRUE, showWarnings = FALSE)
-res <- function(...) file.path(out_dir, "dada2", ...)
+dir.create(file.path(out_dir, getarg("--out-sub", "dada2")), recursive = TRUE, showWarnings = FALSE)
+out_sub <- getarg("--out-sub", "dada2")
+res <- function(...) file.path(out_dir, out_sub, ...)
 say <- function(...) cat(sprintf(...), "\n", sep = "")
 # sprintf() the message first: say("FAILED: ", msg) would make the message an
 # unused argument of the format string and print nothing but the prefix.
@@ -68,7 +69,10 @@ fail <- function(...) { cat("FAILED: ", sprintf(...), "\n", sep = ""); quit(stat
 # ---- samples ---------------------------------------------------------------
 # samples_used.csv is written by step3_abundance.py with the technical controls
 # (blanks, dilution series) already removed, so they can never reach the matrix.
-sfile <- file.path(out_dir, "samples_used.csv")
+# The sample list is passed in, not assumed: a paper can hold several assay
+# types, and feeding another branch's runs to this one would denoise shotgun or
+# RNA reads as if they were this amplicon.
+sfile <- getarg("--samples", file.path(out_dir, "samples_used.csv"))
 if (!file.exists(sfile)) fail("%s missing; run step 3 preflight first", sfile)
 meta <- read.csv(sfile, check.names = FALSE, fileEncoding = "UTF-8-BOM")
 say("%s: %d biological samples", paper, nrow(meta))
@@ -103,7 +107,7 @@ if (length(bad_merge))
              "flagged them for review; pooling them here would mix libraries: %s"),
        length(bad_merge), paste(head(bad_merge, 5), collapse = ", "))
 
-cat_dir <- file.path(out_dir, "dada2", "pooled_runs")
+cat_dir <- res("pooled_runs")
 pool_runs <- function(sid, mate, paths) {
   if (length(paths) == 1) return(paths)
   dir.create(cat_dir, showWarnings = FALSE, recursive = TRUE)
@@ -303,7 +307,7 @@ if (only_probe) {
 }
 
 # ---- filter all samples ----------------------------------------------------
-fdir <- file.path(out_dir, "dada2", "filtered")
+fdir <- res("filtered")
 # Clear it first. filterAndTrim writes no file for a sample whose reads are all
 # removed, so a leftover file from an earlier run at the same path would be
 # picked up by the file.exists() test below and denoised as if it were this

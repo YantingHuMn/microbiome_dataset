@@ -1,0 +1,60 @@
+{
+  "paper_folder": "Castro-Nallar2015",
+  "doi": "10.1186/s12920-015-0121-1",
+  "generated_by": "make_paper_facts.py (measured from the reads)",
+  "generated_on": "2026-10-27",
+  "sources": [
+    "the reads themselves, via step 2's run_sample_mapping.csv",
+    "step 2's metadata extraction (sample identity section)"
+  ],
+  "amplicon": {
+    "status": "measured_from_reads",
+    "region": "unknown_pretrimmed",
+    "paper_statement": "NOT CHECKED - no one has read this paper's Methods. Confirm the primer pair and set status to 'verified' before relying on this for anything but denoising.",
+    "forward_primer": {
+      "name": "unknown_pretrimmed_fwd",
+      "seq": "",
+      "length": 0
+    },
+    "reverse_primer": {
+      "name": "unknown_pretrimmed_rev",
+      "seq": "",
+      "length": 0
+    },
+    "primers_in_reads": false,
+    "primer_evidence": "probed 6 runs: no primer matched; most common 5' 10-mer CCCGTCCCGG (0% of reads) - region must be confirmed from the paper",
+    "read_length": [
+      0,
+      0
+    ],
+    "trim_left": [
+      0,
+      0
+    ],
+    "library_layout": "SINGLE",
+    "insert_length_primer_free": {},
+    "max_trunc_len": [
+      0,
+      0
+    ],
+    "max_trunc_len_reason": "read length; no 3' read-through to avoid",
+    "trunc_len_basis": "RAW read bases. dada2::fastqPairedFilter removes trimLeft first and then truncates to truncLen - trimLeft, keeping only reads at least truncLen long, so a read contributes bases trimLeft+1 .. truncLen.",
+    "merge_budget": {},
+    "read_through": "not applicable to a single-end library"
+  },
+  "sample_identity": {
+    "status": "verified",
+    "from_step2_gate": "pass",
+    "n_biological_samples": 14,
+    "n_technical_controls": 0,
+    "exclude_alias_prefixes": [],
+    "paper_sample_id_confirmed": "14/14",
+    "experimental_group_confirmed": "14/14",
+    "usable_for": [
+      "ASV / relative-abundance tables",
+      "grouped comparisons"
+    ],
+    "not_usable_for": [],
+    "note": "Technical controls come from step 2's per-sample is_technical_control. Add alias prefixes here only if step 2 missed a control that the paper names as one."
+  }
+}

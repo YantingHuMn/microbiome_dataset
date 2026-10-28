@@ -1,0 +1,83 @@
+{
+  "paper_folder": "Cheng2026",
+  "doi": "10.7717/peerj.21234",
+  "generated_by": "make_paper_facts.py (measured from the reads)",
+  "generated_on": "2026-10-27",
+  "sources": [
+    "the reads themselves, via step 2's run_sample_mapping.csv",
+    "step 2's metadata extraction (sample identity section)"
+  ],
+  "amplicon": {
+    "status": "measured_from_reads",
+    "region": "unknown_pretrimmed",
+    "paper_statement": "NOT CHECKED - no one has read this paper's Methods. Confirm the primer pair and set status to 'verified' before relying on this for anything but denoising.",
+    "forward_primer": {
+      "name": "unknown_pretrimmed_fwd",
+      "seq": "",
+      "length": 0
+    },
+    "reverse_primer": {
+      "name": "unknown_pretrimmed_rev",
+      "seq": "",
+      "length": 0
+    },
+    "primers_in_reads": false,
+    "primer_evidence": "probed 6 runs: no primer matched; most common 5' 10-mer CGACCTACGG (92% of reads) - region must be confirmed from the paper",
+    "read_length": [
+      250,
+      250
+    ],
+    "trim_left": [
+      0,
+      0
+    ],
+    "library_layout": "PAIRED",
+    "insert_length_primer_free": {
+      "method": "R1 vs revcomp(R2) overlap over 4564 pairs from 6 runs (>=80% identity in the overlap)",
+      "min": 302,
+      "p1": 427,
+      "p5": 443,
+      "median": 465,
+      "p95": 471,
+      "p99": 471,
+      "max": 474,
+      "modes": [
+        470,
+        447,
+        469,
+        445,
+        471
+      ]
+    },
+    "max_trunc_len": [
+      250,
+      250
+    ],
+    "max_trunc_len_reason": "read length; no 3' read-through to avoid",
+    "trunc_len_basis": "RAW read bases. dada2::fastqPairedFilter removes trimLeft first and then truncates to truncLen - trimLeft, keeping only reads at least truncLen long, so a read contributes bases trimLeft+1 .. truncLen.",
+    "merge_budget": {
+      "min_overlap": 12,
+      "required_raw_sum": 483,
+      "formula": "truncLen[1]+truncLen[2] >= 471 + 12 + 0+0",
+      "available_raw_sum": 500,
+      "slack": 17
+    },
+    "read_through": "0.0% of probed reads reached revcomp of the reverse primer"
+  },
+  "sample_identity": {
+    "status": "partial",
+    "from_step2_gate": "pass_quantification_only:group label confirmed for only 45 of 60 samples. Per-sample matrices are supported; grouped comparisons are NOT.",
+    "n_biological_samples": 60,
+    "n_technical_controls": 0,
+    "exclude_alias_prefixes": [],
+    "paper_sample_id_confirmed": "60/60",
+    "experimental_group_confirmed": "45/60",
+    "usable_for": [
+      "ASV / relative-abundance tables"
+    ],
+    "not_usable_for": [
+      "grouped comparisons: see from_step2_gate"
+    ],
+    "note": "Technical controls come from step 2's per-sample is_technical_control. Add alias prefixes here only if step 2 missed a control that the paper names as one."
+  }
+}
